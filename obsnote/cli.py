@@ -468,15 +468,44 @@ def is_redacted(command: str, settings: Settings) -> bool:
     return False
 
 
+def is_capture_paused() -> bool:
+    return bool(load_last().get("capture_paused"))
+
+
 def cmd_remember_cmd(args: argparse.Namespace) -> int:
     command = " ".join(strip_separator(args.command)).strip()
     if not command:
+        return 0
+    if is_capture_paused():
         return 0
     settings = load_settings()
     if is_redacted(command, settings):
         return 0
     append_command_history(command)
     return 0
+
+
+def cmd_stop(_: argparse.Namespace) -> int:
+    save_last({"capture_paused": True})
+    confirmed = is_capture_paused()
+    print("Pausing passive shell-history capture...")
+    print(f"Confirmed: capture_paused = {confirmed}")
+    if confirmed:
+        print("obsnote will not record anything typed at the shell until you run: obsnote resume")
+        print("Explicit commands (note/run/save/annotate) still work normally -- only the passive")
+        print("PROMPT_COMMAND hook is paused.")
+    else:
+        print("WARNING: could not confirm the paused state was saved. Check permissions on:")
+        print(f"  {state_path()}")
+    return 0 if confirmed else 1
+
+
+def cmd_resume(_: argparse.Namespace) -> int:
+    save_last({"capture_paused": False})
+    confirmed = not is_capture_paused()
+    print("Resuming passive shell-history capture...")
+    print(f"Confirmed: capture_paused = {not confirmed}")
+    return 0 if confirmed else 1
 
 
 def cmd_annotate(args: argparse.Namespace) -> int:
@@ -852,6 +881,8 @@ def cmd_pages(_: argparse.Namespace) -> int:
 def cmd_show(_: argparse.Namespace) -> int:
     settings = load_settings()
     data = load_last()
+    paused = bool(data.get("capture_paused"))
+    print(f"capture: {'PAUSED (run: obsnote resume)' if paused else 'active'}")
     active = data.get("active_page")
     print(f"active page: {active or '(none, using default)'}")
     print(f"default page: {settings.note}")
@@ -1020,6 +1051,12 @@ def cmd_start(_: argparse.Namespace) -> int:
     print("     It should contain __obsnote_prompt_command. If it doesn't: source ~/.bashrc,")
     print("     or open a new terminal (the hook only activates when a shell starts).")
 
+    paused = is_capture_paused()
+    if paused:
+        print("[--] capture is PAUSED -- run: obsnote resume")
+    else:
+        print("[ok] capture is active (not paused)")
+
     ollama_ok = check_ollama(settings)
     print(f"{mark(ollama_ok)} ollama reachable at {settings.ollama_url} (only needed for --synth)")
 
@@ -1143,6 +1180,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     start = sub.add_parser("start", help="check that the vault, config, and shell hook are ready to go")
     start.set_defaults(func=cmd_start)
+
+    stop = sub.add_parser("stop", help="pause passive shell-history capture and confirm it's off")
+    stop.set_defaults(func=cmd_stop)
+
+    resume = sub.add_parser("resume", help="resume passive shell-history capture")
+    resume.set_defaults(func=cmd_resume)
 
     return parser
 
