@@ -182,41 +182,11 @@ def now_stamp() -> str:
     return datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %z")
 
 
-def git_branch(cwd: Path) -> str | None:
-    try:
-        result = subprocess.run(
-            ["git", "symbolic-ref", "--short", "HEAD"],
-            cwd=cwd,
-            capture_output=True,
-            text=True,
-            timeout=2,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return None
-    if result.returncode != 0:
-        return None
-    branch = result.stdout.strip()
-    return branch or None
-
-
-def context_line() -> str:
-    cwd = safe_cwd()
-    if cwd is None:
-        return "`(cwd unavailable)`"
-    home = Path.home()
-    try:
-        display_cwd = f"~/{cwd.relative_to(home)}" if cwd != home else "~"
-    except ValueError:
-        display_cwd = str(cwd)
-    branch = git_branch(cwd)
-    return f"`{display_cwd}` · `{branch}`" if branch else f"`{display_cwd}`"
-
-
-def entry_label(kind: str, tags: str = "") -> str:
-    base = f"`{now_stamp()}` _{kind}_"
+def entry_footer(tags: str = "") -> str:
+    footer = f"From obsnote: {now_stamp()}"
     if tags:
-        base = f"{base} {tags}"
-    return f"{base}\n{context_line()}"
+        footer = f"{footer} {tags}"
+    return footer
 
 
 def normalize_tag(tag: str) -> str:
@@ -463,7 +433,7 @@ def cmd_note(args: argparse.Namespace) -> int:
         raise SystemExit("No note text provided.")
     page = resolve_target_page(args.page, settings)
     tags = format_tags(args.tag)
-    path = append_markdown(settings, page, f"{entry_label('note', tags)}\n\n{text}")
+    path = append_markdown(settings, page, f"{entry_footer(tags)}\n\n{text}")
     print(path)
     return 0
 
@@ -532,7 +502,7 @@ def append_last_command(page: str, tags: str) -> Path:
     settings = load_settings()
     data = require_last_command()
     command = data.get("command")
-    return append_markdown(settings, page, f"{entry_label('command', tags)}\n\n{fence(command, 'bash')}")
+    return append_markdown(settings, page, f"{entry_footer(tags)}\n\n{fence(command, 'bash')}")
 
 
 def append_last_output(page: str, tags: str) -> Path:
@@ -543,8 +513,7 @@ def append_last_output(page: str, tags: str) -> Path:
     output, clipped = clip_output(str(output), settings.max_output_chars)
     clipped_note = "\n\n_Output clipped by obsnote._" if clipped else ""
     markdown = (
-        f"{entry_label('command output', tags)}\n\n"
-        f"Exit code: `{data.get('return_code', 'unknown')}`\n\n"
+        f"{entry_footer(tags)}\n\n"
         f"{fence(str(command), 'bash')}\n\n"
         f"{fence(output, 'text')}"
         f"{clipped_note}"
@@ -682,7 +651,7 @@ def append_last_summary(page: str, tags: str) -> Path:
     output = data.get("output")
     summary = synthesize(settings, str(command), str(output))
     markdown = (
-        f"{entry_label('command summary', tags)}\n\n"
+        f"{entry_footer(tags)}\n\n"
         f"{fence(str(command), 'bash')}\n\n"
         f"{summary}"
     )
@@ -752,7 +721,7 @@ def cmd_mark_show(raw_name: str) -> int:
         print(f"No commands recorded since marker `{name}` (set {marker.get('at', 'unknown')}, page: {page}).")
         return 0
     print(f"--- commands since `{name}` (page: {page}, set {marker.get('at', 'unknown')}) ---\n")
-    print(format_history(entries))
+    print(format_history_markdown(entries))
     return 0
 
 
@@ -771,15 +740,32 @@ def cmd_mark_del(args: argparse.Namespace) -> int:
     return 0
 
 
-def format_history(entries: list[dict[str, str]]) -> str:
-    lines: list[str] = []
+def note_callout(text: str) -> str:
+    lines = str(text).splitlines() or [""]
+    if len(lines) == 1:
+        return f"> [!note] {lines[0]}"
+    quoted = "\n".join(f"> {line}" if line else ">" for line in lines)
+    return f"> [!note]\n{quoted}"
+
+
+def format_history_markdown(entries: list[dict[str, str]]) -> str:
+    blocks: list[str] = []
+    command_lines: list[str] = []
+
+    def flush_commands() -> None:
+        nonlocal command_lines
+        if command_lines:
+            blocks.append(fence("\n".join(command_lines), "bash"))
+            command_lines = []
+
     for entry in entries:
         if entry.get("type") == "note":
-            for line in str(entry.get("text", "")).splitlines() or [""]:
-                lines.append(f"# {line}")
+            flush_commands()
+            blocks.append(note_callout(str(entry.get("text", ""))))
         else:
-            lines.append(str(entry.get("command", "")))
-    return "\n".join(lines)
+            command_lines.append(str(entry.get("command", "")))
+    flush_commands()
+    return "\n\n".join(blocks)
 
 
 def resolve_since_page(args: argparse.Namespace, settings: Settings, marker: dict[str, Any]) -> str:
@@ -800,9 +786,8 @@ def cmd_history_since(args: argparse.Namespace) -> int:
     page = resolve_since_page(args, settings, marker)
     tags = format_tags(args.tag)
     markdown = (
-        f"{entry_label(f'commands since {name}', tags)}\n\n"
-        f"Marker set: `{marker.get('at', 'unknown')}`\n\n"
-        f"{fence(format_history(entries), 'bash')}"
+        f"{entry_footer(tags)}\n\n"
+        f"{format_history_markdown(entries)}"
     )
     path = append_markdown(settings, page, markdown)
     print(path)
@@ -819,10 +804,9 @@ def cmd_synth_since(args: argparse.Namespace) -> int:
     page = resolve_since_page(args, settings, marker)
     tags = format_tags(args.tag)
     markdown = (
-        f"{entry_label(f'summary since {name}', tags)}\n\n"
-        f"Marker set: `{marker.get('at', 'unknown')}`\n\n"
+        f"{entry_footer(tags)}\n\n"
         f"{summary}\n\n"
-        f"{fence(format_history(entries), 'bash')}"
+        f"{format_history_markdown(entries)}"
     )
     path = append_markdown(settings, page, markdown)
     print(path)
@@ -845,7 +829,7 @@ def cmd_page_new(args: argparse.Namespace) -> int:
         )
     title = args.title or Path(page).stem.replace("_", " ").replace("-", " ")
     tags = format_tags(args.tag)
-    content = f"# {title}\n\n{entry_label('page created', tags)}\n"
+    content = f"# {title}\n\n{entry_footer(tags)}\n"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content, encoding="utf-8")
     set_active_page(page)

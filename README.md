@@ -61,15 +61,15 @@ your vault, config, and shell hook, and tells you exactly what's missing.
   one clean bash block. `obsnote marks lab1` previews it first without
   writing anything.
 - **Annotate** drops a note *into* that command timeline mid-session —
-  `obsnote annotate "switching to venv setup here"` shows up as a `# comment`
-  at the right spot the next time you `since` it.
+  `obsnote annotate "switching to venv setup here"` shows up as an Obsidian
+  callout between command blocks the next time you `since` it.
 - **Save / run** capture a single command and its output (or an LLM summary
   of it, if you've got Ollama running locally) instead of a whole marked
   stretch: `obsnote run -- pytest -k foo`.
 
-Every entry gets a timestamp and, best-effort, the directory and git branch
-it was written from — handy context once you're scrolling back through
-weeks of notes.
+Every entry keeps the Markdown quiet: first `From obsnote: <timestamp>` plus
+any tags you explicitly passed, then the captured note, command, output, or
+history.
 
 ## Commands
 

@@ -88,8 +88,10 @@ class CliTest(unittest.TestCase):
         note = self.vault / "notes.md"
         self.assertEqual(stdout.strip(), str(note))
         text = note.read_text(encoding="utf-8")
-        self.assertIn("_note_ #lab", text)
         self.assertIn("hello world", text)
+        self.assertIn("From obsnote:", text)
+        self.assertIn("#lab", text)
+        self.assertLess(text.index("From obsnote:"), text.index("hello world"))
 
     def test_mark_since_writes_command_history(self) -> None:
         self.write_config(vault=str(self.vault), note="notes.md")
@@ -104,10 +106,10 @@ class CliTest(unittest.TestCase):
         note = Path(stdout.strip())
         self.assertEqual(note, self.vault / "notes.md")
         text = note.read_text(encoding="utf-8")
-        self.assertIn("_commands since lab_", text)
-        self.assertIn("echo one", text)
-        self.assertIn("# checkpoint", text)
-        self.assertIn("echo two", text)
+        expected = "```bash\necho one\n```\n\n> [!note] checkpoint\n\n```bash\necho two\n```"
+        self.assertIn(expected, text)
+        self.assertIn("From obsnote:", text)
+        self.assertLess(text.index("From obsnote:"), text.index("```bash"))
 
     def test_invalid_page_path_is_rejected(self) -> None:
         self.write_config(vault=str(self.vault), note="notes.md")
