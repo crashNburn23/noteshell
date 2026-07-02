@@ -24,6 +24,9 @@ assume is private.
 - Notes are plain markdown files on disk. If your vault syncs anywhere
   (Obsidian Sync, iCloud, Dropbox, a git repo), whatever obsnote writes goes
   wherever that syncs.
+- The passive capture keeps a rolling shadow of your shell history (plus the
+  last captured command's full output) in plaintext under
+  `~/.local/state/obsnote/`. `obsnote forget` clears it.
 - Most behavior still lives in one small CLI module (`obsnote/cli.py`) — if
   you're not sure what it's doing with your data, it's a quick read.
 
@@ -41,12 +44,12 @@ pip install -e .
 
 ```bash
 obsnote config --vault ~/path/to/your/ObsidianVault
-obsnote shell-install bash   # wires up automatic command capture
+obsnote shell-install bash   # wires up automatic command capture (or: zsh)
 source ~/.bashrc             # or just open a new terminal
-obsnote start                # sanity-check that all of the above actually worked
+obsnote doctor               # sanity-check that all of the above actually worked
 ```
 
-`obsnote start` is worth running any time something seems off — it checks
+`obsnote doctor` is worth running any time something seems off — it checks
 your vault, config, and shell hook, and tells you exactly what's missing.
 
 ## The mental model
@@ -59,10 +62,17 @@ your vault, config, and shell hook, and tells you exactly what's missing.
 - **Marks** are checkpoints in your shell history. `obsnote mark lab1`, do
   some work, `obsnote since lab1` writes everything you typed in between as
   one clean bash block. `obsnote marks lab1` previews it first without
-  writing anything.
+  writing anything. The hook records each command's exit status and working
+  directory, so the rendered block flags failures (`# exited 1`), notes
+  directory changes (`# in ~/proj`) when the stretch spans more than one, and
+  `obsnote since lab1 --ok-only` drops the failed attempts and keeps the path
+  that worked.
 - **Annotate** drops a note *into* that command timeline mid-session —
   `obsnote annotate "switching to venv setup here"` shows up as an Obsidian
   callout between command blocks the next time you `since` it.
+- **Summary** adds a top-of-session summary while you are still working —
+  `obsnote summary "tests fail on auth setup"` is rendered before the command
+  timeline when you later post the mark with `obsnote since ...`.
 - **Save / run** capture a single command and its output (or an LLM summary
   of it, if you've got Ollama running locally) instead of a whole marked
   stretch: `obsnote run -- pytest -k foo`.
@@ -82,25 +92,30 @@ history.
 | `obsnote mark [name]` | set a checkpoint in your shell history |
 | `obsnote marks [name]` | list markers, or preview commands since one |
 | `obsnote unmark [name]` | delete a marker |
-| `obsnote since [name] [--synth]` | write everything since a marker (optionally summarized) |
+| `obsnote since [name] [--synth] [--ok-only]` | write everything since a marker (optionally summarized, optionally only what succeeded) |
 | `obsnote annotate [text]` | insert a note into the pending command timeline |
+| `obsnote summary [text]` | add a summary that posts before the pending command timeline |
+| `obsnote undo [--page]` | remove the last obsnote entry from a page |
 | `obsnote page new/use <name>` | create or switch the active page |
 | `obsnote pages` | list pages in the vault |
 | `obsnote tail [--page] [-n]` | read-only peek at the last entries on a page |
 | `obsnote show` | read-only status: capture state, active page, last command, markers |
-| `obsnote start` | preflight check: vault, config, shell hook |
-| `obsnote stop` / `obsnote resume` | pause/resume passive shell-history capture, with a confirmed status readout |
+| `obsnote doctor` | preflight check: vault, config, shell hook |
+| `obsnote pause` / `obsnote resume` | pause/resume passive shell-history capture, with a confirmed status readout |
+| `obsnote forget [--last N]` | clear captured commands/output from obsnote's local state (the vault is untouched) |
 
 Run `obsnote <command> --help` for the full flag list on any of these.
 
 ## Shell integration
 
-`obsnote shell-install bash` adds a `PROMPT_COMMAND` hook to `~/.bashrc` that
-passively records every command you type (skipping obsnote's own commands).
-Two guardrails on top of that:
+`obsnote shell-install bash` adds a `PROMPT_COMMAND` hook to `~/.bashrc`
+(`obsnote shell-install zsh` adds a `precmd` hook to `~/.zshrc`) that
+passively records every command you type — along with its exit status and
+working directory — while skipping obsnote's own commands. Two guardrails on
+top of that:
 
-- A **leading space** before a command keeps it out of both bash's history
-  and obsnote's capture — the standard `HISTCONTROL=ignorespace` convention,
+- A **leading space** before a command keeps it out of both the shell's
+  history and obsnote's capture — the standard `ignorespace` convention,
   which the hook turns on automatically if it isn't already.
 - A **redact pattern list** silently drops commands that look like they
   contain a live credential (`TOKEN=...`, `mysql -pSECRET`, `Authorization:
@@ -111,8 +126,15 @@ Two guardrails on top of that:
 through obsnote, that's an intentional capture, not passive history.
 
 Doing something sensitive and don't trust the pattern list to catch it? Run
-`obsnote stop` to pause passive capture entirely (it reads the state back and
-confirms it actually took), and `obsnote resume` when you're done.
+`obsnote pause` to pause passive capture entirely (it reads the state back
+and confirms it actually took), and `obsnote resume` when you're done. If
+something already slipped into the capture buffer, `obsnote forget --last 5`
+(or plain `obsnote forget` for everything) scrubs it from local state.
+
+One more guardrail: the *active page* is remembered per vault. If a
+project-local `.obsnote.json` points a directory at a different vault, a page
+you activated elsewhere is ignored there instead of silently creating a
+same-named file in the wrong vault.
 
 ## Config
 
@@ -127,8 +149,11 @@ without touching your global setup.
 
 Early, actively-changing personal tool. There is now a small standard-library
 test suite for the core CLI/state behavior, but no broad compatibility matrix
-or security guarantees. If something breaks, `obsnote start` and `obsnote show`
+or security guarantees. If something breaks, `obsnote doctor` and `obsnote show`
 are your first stop for diagnosing it.
+
+Older command names (`start`, `stop`, `last`, `synth`, `history-since`, ...)
+keep working as aliases for their renamed equivalents.
 
 ## License
 

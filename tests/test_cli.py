@@ -111,6 +111,186 @@ class CliTest(unittest.TestCase):
         self.assertIn("From obsnote:", text)
         self.assertLess(text.index("From obsnote:"), text.index("```bash"))
 
+    def test_mark_summary_posts_before_command_history(self) -> None:
+        self.write_config(vault=str(self.vault), note="notes.md")
+
+        self.run_cli("mark", "lab")
+        self.run_cli("remember-cmd", "--", "echo one")
+        self.run_cli("summary", "installed dependencies and reached failing tests")
+        self.run_cli("remember-cmd", "--", "pytest")
+        code, stdout, _ = self.run_cli("since", "lab")
+
+        self.assertEqual(code, 0)
+        text = Path(stdout.strip()).read_text(encoding="utf-8")
+        summary = "> [!summary] installed dependencies and reached failing tests"
+        self.assertIn(summary, text)
+        self.assertLess(text.index(summary), text.index("```bash\necho one"))
+        self.assertLess(text.index(summary), text.index("pytest"))
+
+    def test_remember_cmd_preserves_multiline_command(self) -> None:
+        self.write_config(vault=str(self.vault), note="notes.md")
+        command = "cat <<'EOF'\nalpha\nbeta\nEOF"
+
+        self.run_cli("mark", "lab")
+        self.run_cli("remember-cmd", "--", command)
+        code, stdout, _ = self.run_cli("since", "lab")
+
+        self.assertEqual(code, 0)
+        self.assertEqual(self.read_state()["command"], command)
+        text = Path(stdout.strip()).read_text(encoding="utf-8")
+        self.assertIn(f"```bash\n{command}\n```", text)
+
+    def test_shell_init_uses_multiline_history_capture(self) -> None:
+        code, stdout, _ = self.run_cli("shell-init", "bash")
+
+        self.assertEqual(code, 0)
+        self.assertIn("shopt -s cmdhist lithist", stdout)
+        self.assertIn("fc -ln -1", stdout)
+        self.assertNotIn("history 1", stdout)
+
+    def test_tail_splits_entries_in_current_format(self) -> None:
+        self.write_config(vault=str(self.vault), note="notes.md")
+        for i in range(3):
+            self.run_cli("note", f"entry number {i}")
+
+        code, stdout, _ = self.run_cli("tail", "-n", "2")
+
+        self.assertEqual(code, 0)
+        self.assertIn("last 2 of 3 entries", stdout)
+        self.assertNotIn("entry number 0", stdout)
+        self.assertIn("entry number 1", stdout)
+        self.assertIn("entry number 2", stdout)
+
+    def test_tail_splits_legacy_entry_headers(self) -> None:
+        self.write_config(vault=str(self.vault), note="notes.md")
+        (self.vault / "notes.md").write_text(
+            "`echo one` _2025-01-01 10:00:00 +0000_\n\nold entry\n\n"
+            "`echo two` _2025-01-01 11:00:00 +0000_\n\nnewer entry\n",
+            encoding="utf-8",
+        )
+
+        code, stdout, _ = self.run_cli("tail", "-n", "1")
+
+        self.assertEqual(code, 0)
+        self.assertIn("last 1 of 2 entries", stdout)
+        self.assertNotIn("old entry", stdout)
+        self.assertIn("newer entry", stdout)
+
+    def test_pause_and_legacy_stop_alias(self) -> None:
+        code, stdout, _ = self.run_cli("pause")
+        self.assertEqual(code, 0)
+        self.assertIn("capture_paused = True", stdout)
+
+        self.run_cli("resume")
+        code, stdout, _ = self.run_cli("stop")
+        self.assertEqual(code, 0)
+        self.assertIn("capture_paused = True", stdout)
+
+    def test_doctor_and_legacy_start_alias(self) -> None:
+        self.write_config(vault=str(self.vault), note="notes.md")
+        for name in ("doctor", "start"):
+            code, stdout, _ = self.run_cli(name)
+            self.assertIn("obsnote preflight check", stdout, name)
+
+    def test_undo_removes_only_last_entry(self) -> None:
+        self.write_config(vault=str(self.vault), note="notes.md")
+        self.run_cli("note", "keep me")
+        self.run_cli("note", "remove me")
+
+        code, stdout, _ = self.run_cli("undo")
+
+        self.assertEqual(code, 0)
+        self.assertIn("Removed the last entry", stdout)
+        text = (self.vault / "notes.md").read_text(encoding="utf-8")
+        self.assertIn("keep me", text)
+        self.assertNotIn("remove me", text)
+
+        self.run_cli("undo")
+        with self.assertRaises(SystemExit):
+            self.run_cli("undo")
+
+    def test_forget_clears_captured_state(self) -> None:
+        self.write_config(vault=str(self.vault), note="notes.md")
+        self.run_cli("mark", "lab")
+        self.run_cli("remember-cmd", "--", "echo one")
+        self.run_cli("remember-cmd", "--", "echo two")
+
+        code, stdout, _ = self.run_cli("forget", "--last", "1")
+        self.assertEqual(code, 0)
+        state = self.read_state()
+        self.assertEqual([e["command"] for e in state["command_history"]], ["echo one"])
+        self.assertNotIn("command", state)
+
+        code, _, _ = self.run_cli("forget")
+        self.assertEqual(code, 0)
+        state = self.read_state()
+        self.assertNotIn("command_history", state)
+        self.assertNotIn("markers", state)
+
+    def test_since_renders_exit_codes_and_cwd_changes(self) -> None:
+        self.write_config(vault=str(self.vault), note="notes.md")
+        self.run_cli("mark", "lab")
+        self.run_cli("remember-cmd", "--status", "0", "--cwd", "/srv/one", "--", "echo ok")
+        self.run_cli("remember-cmd", "--status", "1", "--cwd", "/srv/two", "--", "false")
+
+        code, stdout, _ = self.run_cli("since", "lab")
+
+        self.assertEqual(code, 0)
+        text = Path(stdout.strip()).read_text(encoding="utf-8")
+        self.assertIn("# in /srv/one", text)
+        self.assertIn("# in /srv/two", text)
+        self.assertIn("false\n# exited 1", text)
+        self.assertNotIn("echo ok\n# exited", text)
+
+    def test_since_ok_only_drops_failed_commands(self) -> None:
+        self.write_config(vault=str(self.vault), note="notes.md")
+        self.run_cli("mark", "lab")
+        self.run_cli("remember-cmd", "--status", "0", "--", "echo ok")
+        self.run_cli("remember-cmd", "--status", "1", "--", "false")
+
+        code, stdout, _ = self.run_cli("since", "lab", "--ok-only")
+
+        self.assertEqual(code, 0)
+        text = Path(stdout.strip()).read_text(encoding="utf-8")
+        self.assertIn("echo ok", text)
+        self.assertNotIn("false", text)
+
+    def test_since_uniform_cwd_is_not_annotated(self) -> None:
+        self.write_config(vault=str(self.vault), note="notes.md")
+        self.run_cli("mark", "lab")
+        self.run_cli("remember-cmd", "--cwd", "/srv/one", "--", "echo a")
+        self.run_cli("remember-cmd", "--cwd", "/srv/one", "--", "echo b")
+
+        code, stdout, _ = self.run_cli("since", "lab")
+
+        self.assertEqual(code, 0)
+        text = Path(stdout.strip()).read_text(encoding="utf-8")
+        self.assertNotIn("# in /srv/one", text)
+
+    def test_active_page_ignored_when_vault_changes(self) -> None:
+        self.write_config(vault=str(self.vault), note="notes.md")
+        self.run_cli("page", "new", "Course/Lab1")
+
+        other_vault = self.root / "other-vault"
+        other_vault.mkdir()
+        self.write_config(vault=str(other_vault), note="notes.md")
+
+        code, stdout, _ = self.run_cli("note", "where does this land")
+
+        self.assertEqual(code, 0)
+        self.assertEqual(Path(stdout.strip()), other_vault / "notes.md")
+        self.assertFalse((other_vault / "Course" / "Lab1.md").exists())
+
+        _, stdout, _ = self.run_cli("page")
+        self.assertIn("it was set for a different vault", stdout)
+
+    def test_shell_init_zsh_prints_precmd_hook(self) -> None:
+        code, stdout, _ = self.run_cli("shell-init", "zsh")
+
+        self.assertEqual(code, 0)
+        self.assertIn("add-zsh-hook precmd __obsnote_precmd", stdout)
+        self.assertIn('remember-cmd --status "$last_status" --cwd "$PWD"', stdout)
+
     def test_invalid_page_path_is_rejected(self) -> None:
         self.write_config(vault=str(self.vault), note="notes.md")
 

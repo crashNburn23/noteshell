@@ -43,7 +43,12 @@ DEFAULT_REDACT_PATTERNS = [
     r"-----BEGIN [A-Z ]*PRIVATE KEY-----",
 ]
 
-ENTRY_HEADER_RE = re.compile(r"(?m)^`[^`\n]+`\s+_[^_\n]+_.*$")
+# Matches the start of an entry on a page: the current `From obsnote: <timestamp>`
+# footer line, or the pre-9d9d741 "`command` _timestamp_" header still present in
+# older vault pages.
+ENTRY_HEADER_RE = re.compile(
+    r"(?m)^(?:From obsnote: \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} [+-]\d{4}.*|`[^`\n]+`\s+_[^_\n]+_.*)$"
+)
 
 
 @dataclass(frozen=True)
@@ -216,17 +221,39 @@ def normalize_page_name(raw: str) -> str:
     return name
 
 
+def active_page_for(settings: Settings, data: dict[str, Any] | None = None) -> tuple[str | None, str | None]:
+    """Return (usable_active_page, mismatched_page).
+
+    The active page only counts when it was set for the vault currently in
+    effect. Project-local configs can swap vaults between directories, and a
+    page set in one vault must not silently target a same-named file in
+    another. When the vaults differ, the second element carries the ignored
+    page name so status commands can explain why it isn't being used.
+    """
+    if data is None:
+        data = load_last()
+    page = data.get("active_page")
+    if not (isinstance(page, str) and page.strip()):
+        return None, None
+    recorded = data.get("active_page_vault")
+    if (
+        isinstance(recorded, str)
+        and settings.vault is not None
+        and Path(recorded).expanduser() != settings.vault
+    ):
+        return None, page
+    return page, None
+
+
 def resolve_target_page(explicit: str | None, settings: Settings) -> str:
     if explicit:
         return normalize_page_name(explicit)
-    active = load_last().get("active_page")
-    if isinstance(active, str) and active.strip():
-        return active
-    return settings.note
+    active, _ = active_page_for(settings)
+    return active if active else settings.note
 
 
-def set_active_page(page: str) -> None:
-    save_last({"active_page": page})
+def set_active_page(page: str, settings: Settings) -> None:
+    save_last({"active_page": page, "active_page_vault": str(settings.vault) if settings.vault else None})
 
 
 def append_markdown(settings: Settings, note: str, markdown: str) -> Path:
@@ -281,22 +308,27 @@ def load_last() -> dict[str, Any]:
     return load_json(state_path())
 
 
-def command_history(data: dict[str, Any]) -> list[dict[str, str]]:
+def command_history(data: dict[str, Any]) -> list[dict[str, Any]]:
     raw = data.get("command_history", [])
     if not isinstance(raw, list):
         return []
-    history: list[dict[str, str]] = []
+    history: list[dict[str, Any]] = []
     for item in raw:
         if not isinstance(item, dict):
             continue
-        if item.get("type") == "note" and isinstance(item.get("text"), str):
-            history.append({"at": str(item.get("at", "")), "type": "note", "text": item["text"]})
+        if item.get("type") in ("note", "summary") and isinstance(item.get("text"), str):
+            history.append({"at": str(item.get("at", "")), "type": str(item["type"]), "text": item["text"]})
         elif isinstance(item.get("command"), str):
-            history.append({"at": str(item.get("at", "")), "type": "command", "command": item["command"]})
+            entry: dict[str, Any] = {"at": str(item.get("at", "")), "type": "command", "command": item["command"]}
+            if isinstance(item.get("status"), int):
+                entry["status"] = item["status"]
+            if isinstance(item.get("cwd"), str):
+                entry["cwd"] = item["cwd"]
+            history.append(entry)
     return history
 
 
-def append_history_entry(data: dict[str, Any], history: list[dict[str, str]], entry: dict[str, str]) -> list[dict[str, str]]:
+def append_history_entry(data: dict[str, Any], history: list[dict[str, Any]], entry: dict[str, Any]) -> list[dict[str, Any]]:
     history = [*history, entry]
     if len(history) > DEFAULT_HISTORY_LIMIT:
         trim = len(history) - DEFAULT_HISTORY_LIMIT
@@ -309,7 +341,13 @@ def append_history_entry(data: dict[str, Any], history: list[dict[str, str]], en
     return history
 
 
-def append_command_history(command: str, *, clear_output: bool = True) -> None:
+def append_command_history(
+    command: str,
+    *,
+    clear_output: bool = True,
+    status: int | None = None,
+    cwd: str | None = None,
+) -> None:
     data = load_last()
     history = command_history(data)
     if history and history[-1].get("type") == "command" and history[-1]["command"] == command:
@@ -320,7 +358,12 @@ def append_command_history(command: str, *, clear_output: bool = True) -> None:
         data["updated_at"] = now_stamp()
         save_json(state_path(), data)
         return
-    history = append_history_entry(data, history, {"at": now_stamp(), "type": "command", "command": command})
+    entry: dict[str, Any] = {"at": now_stamp(), "type": "command", "command": command}
+    if status is not None:
+        entry["status"] = status
+    if cwd is not None:
+        entry["cwd"] = cwd
+    history = append_history_entry(data, history, entry)
     data["command"] = command
     if clear_output:
         data.pop("output", None)
@@ -339,6 +382,15 @@ def append_annotation(text: str) -> None:
     save_json(state_path(), data)
 
 
+def append_session_summary(text: str) -> None:
+    data = load_last()
+    history = command_history(data)
+    history = append_history_entry(data, history, {"at": now_stamp(), "type": "summary", "text": text})
+    data["command_history"] = history
+    data["updated_at"] = now_stamp()
+    save_json(state_path(), data)
+
+
 def markers(data: dict[str, Any]) -> dict[str, Any]:
     raw = data.get("markers", {})
     return raw if isinstance(raw, dict) else {}
@@ -348,7 +400,7 @@ def marker_name(value: str | None) -> str:
     return value.strip() if value and value.strip() else "default"
 
 
-def history_since_marker(name: str) -> tuple[dict[str, Any], list[dict[str, str]]]:
+def history_since_marker(name: str) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     data = load_last()
     history = command_history(data)
     marker = markers(data).get(name)
@@ -461,11 +513,11 @@ def cmd_remember_cmd(args: argparse.Namespace) -> int:
     settings = load_settings()
     if is_redacted(command, settings):
         return 0
-    append_command_history(command)
+    append_command_history(command, status=args.status, cwd=args.cwd)
     return 0
 
 
-def cmd_stop(_: argparse.Namespace) -> int:
+def cmd_pause(_: argparse.Namespace) -> int:
     save_last({"capture_paused": True})
     confirmed = is_capture_paused()
     print("Pausing passive shell-history capture...")
@@ -473,11 +525,69 @@ def cmd_stop(_: argparse.Namespace) -> int:
     if confirmed:
         print("obsnote will not record anything typed at the shell until you run: obsnote resume")
         print("Explicit commands (note/run/save/annotate) still work normally -- only the passive")
-        print("PROMPT_COMMAND hook is paused.")
+        print("shell hook is paused.")
     else:
         print("WARNING: could not confirm the paused state was saved. Check permissions on:")
         print(f"  {state_path()}")
     return 0 if confirmed else 1
+
+
+def cmd_forget(args: argparse.Namespace) -> int:
+    data = load_last()
+    history = command_history(data)
+    if args.last is not None:
+        if args.last <= 0:
+            raise SystemExit("--last must be a positive number of commands.")
+        forgotten = min(args.last, len(history))
+        history = history[: len(history) - forgotten]
+        data["command_history"] = history
+        for marker in markers(data).values():
+            if isinstance(marker, dict) and isinstance(marker.get("index"), int):
+                marker["index"] = min(marker["index"], len(history))
+        for key in ("command", "output", "return_code"):
+            data.pop(key, None)
+        print(f"Forgot the last {forgotten} captured command(s) and the last remembered command/output.")
+    else:
+        forgotten = len(history)
+        marker_count = len(markers(data))
+        for key in ("command_history", "command", "output", "return_code", "markers"):
+            data.pop(key, None)
+        print(
+            f"Forgot {forgotten} captured command(s), the last remembered command/output, "
+            f"and {marker_count} marker(s)."
+        )
+    data["updated_at"] = now_stamp()
+    save_json(state_path(), data)
+    print("Nothing already written to the vault was touched -- `obsnote undo` removes vault entries.")
+    return 0
+
+
+def cmd_undo(args: argparse.Namespace) -> int:
+    settings = load_settings()
+    page = resolve_target_page(args.page, settings)
+    path = resolve_note_path(settings, page)
+    if not path.exists():
+        raise SystemExit(f"No such page: {page}")
+    text = path.read_text(encoding="utf-8")
+    matches = list(ENTRY_HEADER_RE.finditer(text))
+    if not matches:
+        raise SystemExit(f"No obsnote entries found in {page}.")
+    start = matches[-1].start()
+    removed = text[start:].rstrip()
+    remaining = text[:start].rstrip()
+    path.write_text(f"{remaining}\n" if remaining else "", encoding="utf-8")
+    lines = removed.splitlines()
+    preview = next(
+        (line for line in lines[1:] if line.strip() and not line.lstrip().startswith("```")),
+        "",
+    )
+    print(f"Removed the last entry from {page}:")
+    print(f"  {lines[0]}")
+    if preview:
+        print(f"  {preview}")
+    left = len(matches) - 1
+    print(f"{left} {'entry remains' if left == 1 else 'entries remain'}.")
+    return 0
 
 
 def cmd_resume(_: argparse.Namespace) -> int:
@@ -498,6 +608,16 @@ def cmd_annotate(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_summary(args: argparse.Namespace) -> int:
+    text_argv = strip_separator(args.text)
+    text = " ".join(text_argv).strip() if text_argv else sys.stdin.read().strip()
+    if not text:
+        raise SystemExit("No summary text provided.")
+    append_session_summary(text)
+    print(f"Summarized: {text}")
+    return 0
+
+
 def append_last_command(page: str, tags: str) -> Path:
     settings = load_settings()
     data = require_last_command()
@@ -512,10 +632,13 @@ def append_last_output(page: str, tags: str) -> Path:
     output = data.get("output")
     output, clipped = clip_output(str(output), settings.max_output_chars)
     clipped_note = "\n\n_Output clipped by obsnote._" if clipped else ""
+    return_code = data.get("return_code")
+    exit_note = f"\n\n_Exited with code {return_code}._" if isinstance(return_code, int) and return_code != 0 else ""
     markdown = (
         f"{entry_footer(tags)}\n\n"
         f"{fence(str(command), 'bash')}\n\n"
         f"{fence(output, 'text')}"
+        f"{exit_note}"
         f"{clipped_note}"
     )
     return append_markdown(settings, page, markdown)
@@ -602,11 +725,13 @@ def clean_llm_response(text: Any) -> str:
     return cleaned
 
 
-def synthesize_history(settings: Settings, name: str, entries: list[dict[str, str]]) -> str:
+def synthesize_history(settings: Settings, name: str, entries: list[dict[str, Any]]) -> str:
     lines = []
     for entry in entries:
         if entry.get("type") == "note":
             lines.append(f"- {entry['at']}: [note] {entry.get('text', '')}")
+        elif entry.get("type") == "summary":
+            lines.append(f"- {entry['at']}: [summary] {entry.get('text', '')}")
         else:
             lines.append(f"- {entry['at']}: {entry.get('command', '')}")
     command_list = "\n".join(lines)
@@ -721,7 +846,7 @@ def cmd_mark_show(raw_name: str) -> int:
         print(f"No commands recorded since marker `{name}` (set {marker.get('at', 'unknown')}, page: {page}).")
         return 0
     print(f"--- commands since `{name}` (page: {page}, set {marker.get('at', 'unknown')}) ---\n")
-    print(format_history_markdown(entries))
+    print(format_session_markdown(entries))
     return 0
 
 
@@ -748,9 +873,31 @@ def note_callout(text: str) -> str:
     return f"> [!note]\n{quoted}"
 
 
-def format_history_markdown(entries: list[dict[str, str]]) -> str:
+def summary_callout(text: str) -> str:
+    lines = str(text).splitlines() or [""]
+    if len(lines) == 1:
+        return f"> [!summary] {lines[0]}"
+    quoted = "\n".join(f"> {line}" if line else ">" for line in lines)
+    return f"> [!summary]\n{quoted}"
+
+
+def abbrev_home(path: str) -> str:
+    home = str(Path.home())
+    if path == home:
+        return "~"
+    if path.startswith(home + os.sep):
+        return "~" + path[len(home):]
+    return path
+
+
+def format_history_markdown(entries: list[dict[str, Any]]) -> str:
     blocks: list[str] = []
     command_lines: list[str] = []
+    # Directory comments only appear when the stretch actually spans more than
+    # one directory -- a uniform stretch stays clean.
+    dirs = {e["cwd"] for e in entries if e.get("type") == "command" and isinstance(e.get("cwd"), str)}
+    annotate_cwd = len(dirs) > 1
+    current_cwd: str | None = None
 
     def flush_commands() -> None:
         nonlocal command_lines
@@ -762,10 +909,43 @@ def format_history_markdown(entries: list[dict[str, str]]) -> str:
         if entry.get("type") == "note":
             flush_commands()
             blocks.append(note_callout(str(entry.get("text", ""))))
+        elif entry.get("type") == "summary":
+            continue
         else:
+            cwd = entry.get("cwd")
+            if annotate_cwd and isinstance(cwd, str) and cwd != current_cwd:
+                command_lines.append(f"# in {abbrev_home(cwd)}")
+                current_cwd = cwd
             command_lines.append(str(entry.get("command", "")))
+            status = entry.get("status")
+            if isinstance(status, int) and status != 0:
+                command_lines.append(f"# exited {status}")
     flush_commands()
     return "\n\n".join(blocks)
+
+
+def format_session_summary_markdown(entries: list[dict[str, Any]]) -> str:
+    return "\n\n".join(
+        summary_callout(str(entry.get("text", "")))
+        for entry in entries
+        if entry.get("type") == "summary"
+    )
+
+
+def format_session_markdown(entries: list[dict[str, Any]]) -> str:
+    return "\n\n".join(
+        block
+        for block in (format_session_summary_markdown(entries), format_history_markdown(entries))
+        if block
+    )
+
+
+def filter_ok_only(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        entry
+        for entry in entries
+        if entry.get("type") in ("note", "summary") or entry.get("status") in (None, 0)
+    ]
 
 
 def resolve_since_page(args: argparse.Namespace, settings: Settings, marker: dict[str, Any]) -> str:
@@ -777,17 +957,26 @@ def resolve_since_page(args: argparse.Namespace, settings: Settings, marker: dic
     return resolve_target_page(None, settings)
 
 
-def cmd_history_since(args: argparse.Namespace) -> int:
-    settings = load_settings()
-    name = marker_name(args.name)
+def since_entries(args: argparse.Namespace, name: str) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     marker, entries = history_since_marker(name)
     if not entries:
         raise SystemExit(f"No commands recorded since marker `{name}`.")
+    if getattr(args, "ok_only", False):
+        entries = filter_ok_only(entries)
+        if not entries:
+            raise SystemExit(f"No successful commands recorded since marker `{name}` (--ok-only).")
+    return marker, entries
+
+
+def cmd_history_since(args: argparse.Namespace) -> int:
+    settings = load_settings()
+    name = marker_name(args.name)
+    marker, entries = since_entries(args, name)
     page = resolve_since_page(args, settings, marker)
     tags = format_tags(args.tag)
     markdown = (
         f"{entry_footer(tags)}\n\n"
-        f"{format_history_markdown(entries)}"
+        f"{format_session_markdown(entries)}"
     )
     path = append_markdown(settings, page, markdown)
     print(path)
@@ -797,16 +986,14 @@ def cmd_history_since(args: argparse.Namespace) -> int:
 def cmd_synth_since(args: argparse.Namespace) -> int:
     settings = load_settings()
     name = marker_name(args.name)
-    marker, entries = history_since_marker(name)
-    if not entries:
-        raise SystemExit(f"No commands recorded since marker `{name}`.")
+    marker, entries = since_entries(args, name)
     summary = synthesize_history(settings, name, entries)
     page = resolve_since_page(args, settings, marker)
     tags = format_tags(args.tag)
     markdown = (
         f"{entry_footer(tags)}\n\n"
         f"{summary}\n\n"
-        f"{format_history_markdown(entries)}"
+        f"{format_session_markdown(entries)}"
     )
     path = append_markdown(settings, page, markdown)
     print(path)
@@ -832,7 +1019,7 @@ def cmd_page_new(args: argparse.Namespace) -> int:
     content = f"# {title}\n\n{entry_footer(tags)}\n"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content, encoding="utf-8")
-    set_active_page(page)
+    set_active_page(page, settings)
     print(f"Created page: {page}")
     print(f"Active page: {page}")
     return 0
@@ -844,15 +1031,17 @@ def cmd_page_use(args: argparse.Namespace) -> int:
     path = resolve_note_path(settings, page)
     if not path.exists():
         raise SystemExit(f"No such page: {page}\nUse `obsnote page new {page}` to create it.")
-    set_active_page(page)
+    set_active_page(page, settings)
     print(f"Active page: {page}")
     return 0
 
 
 def cmd_page_show(_: argparse.Namespace) -> int:
     settings = load_settings()
-    active = load_last().get("active_page")
+    active, mismatched = active_page_for(settings)
     print(f"active: {active or '(none, using default)'}")
+    if mismatched:
+        print(f"  (ignoring `{mismatched}` -- it was set for a different vault)")
     print(f"default: {settings.note}")
     return 0
 
@@ -861,7 +1050,7 @@ def cmd_pages(_: argparse.Namespace) -> int:
     settings = load_settings()
     if settings.vault is None:
         raise SystemExit("No Obsidian vault configured. Run: obsnote config --vault /path/to/vault")
-    active = load_last().get("active_page")
+    active, _ = active_page_for(settings)
     files = sorted(p.relative_to(settings.vault).as_posix() for p in settings.vault.rglob("*.md"))
     if not files:
         print("No pages found in vault.")
@@ -877,8 +1066,10 @@ def cmd_show(_: argparse.Namespace) -> int:
     data = load_last()
     paused = bool(data.get("capture_paused"))
     print(f"capture: {'PAUSED (run: obsnote resume)' if paused else 'active'}")
-    active = data.get("active_page")
+    active, mismatched = active_page_for(settings, data)
     print(f"active page: {active or '(none, using default)'}")
+    if mismatched:
+        print(f"  (ignoring `{mismatched}` -- it was set for a different vault)")
     print(f"default page: {settings.note}")
     command = data.get("command")
     if command:
@@ -930,11 +1121,11 @@ def cmd_tail(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_shell_init(args: argparse.Namespace) -> int:
-    if args.shell != "bash":
-        raise SystemExit("Only bash shell integration is currently supported.")
-    print(
-        r'''
+BASH_SHELL_INIT = r'''
+# Keep compound/pasted multiline commands as one history entry with literal
+# newlines, so obsnote captures the command the way it was typed.
+shopt -s cmdhist lithist
+
 # A leading space on a typed command keeps it out of bash history entirely
 # (and therefore out of obsnote's capture too) -- the standard bash convention
 # for "don't record this". obsnote turns it on if it isn't already.
@@ -945,14 +1136,14 @@ esac
 export HISTCONTROL
 
 __obsnote_prompt_command() {
-  local status=$?
+  local last_status=$?
   local cmd
-  cmd="$(HISTTIMEFORMAT= history 1 | sed 's/^[[:space:]]*[0-9]\+[[:space:]]*//')"
+  cmd="$(HISTTIMEFORMAT= fc -ln -1 2>/dev/null | sed '1s/^[[:space:]]*//')"
   case "$cmd" in
     ""|obsnote*) ;;
-    *) obsnote remember-cmd -- "$cmd" >/dev/null 2>&1 || true ;;
+    *) obsnote remember-cmd --status "$last_status" --cwd "$PWD" -- "$cmd" >/dev/null 2>&1 || true ;;
   esac
-  return $status
+  return $last_status
 }
 
 case ";$PROMPT_COMMAND;" in
@@ -960,29 +1151,59 @@ case ";$PROMPT_COMMAND;" in
   *) PROMPT_COMMAND="__obsnote_prompt_command${PROMPT_COMMAND:+;$PROMPT_COMMAND}" ;;
 esac
 '''.strip()
-    )
+
+# `status` is a read-only special parameter in zsh, hence `last_status`.
+ZSH_SHELL_INIT = r'''
+# A leading space on a typed command keeps it out of zsh history entirely
+# (and therefore out of obsnote's capture too).
+setopt hist_ignore_space
+
+__obsnote_precmd() {
+  local last_status=$?
+  local cmd
+  cmd="$(fc -ln -1 2>/dev/null | sed '1s/^[[:space:]]*//')"
+  case "$cmd" in
+    ""|obsnote*) ;;
+    *) obsnote remember-cmd --status "$last_status" --cwd "$PWD" -- "$cmd" >/dev/null 2>&1 || true ;;
+  esac
+  return 0
+}
+
+autoload -Uz add-zsh-hook
+add-zsh-hook precmd __obsnote_precmd
+'''.strip()
+
+SHELL_INIT = {"bash": BASH_SHELL_INIT, "zsh": ZSH_SHELL_INIT}
+SHELL_RC = {"bash": ".bashrc", "zsh": ".zshrc"}
+
+
+def cmd_shell_init(args: argparse.Namespace) -> int:
+    print(SHELL_INIT[args.shell])
     return 0
 
 
-def bash_init_block() -> str:
-    return '\n# obsnote shell integration\nif command -v obsnote >/dev/null 2>&1; then\n  eval "$(obsnote shell-init bash)"\nfi\n'
+def shell_init_block(shell: str) -> str:
+    return (
+        "\n# obsnote shell integration\n"
+        "if command -v obsnote >/dev/null 2>&1; then\n"
+        f'  eval "$(obsnote shell-init {shell})"\n'
+        "fi\n"
+    )
 
 
 def cmd_shell_install(args: argparse.Namespace) -> int:
-    if args.shell != "bash":
-        raise SystemExit("Only bash shell integration is currently supported.")
-    bashrc = Path.home() / ".bashrc"
-    existing = bashrc.read_text(encoding="utf-8") if bashrc.exists() else ""
+    rc = Path.home() / SHELL_RC[args.shell]
+    existing = rc.read_text(encoding="utf-8") if rc.exists() else ""
     marker = "obsnote shell integration"
     if marker in existing:
-        print(f"obsnote shell integration is already present in {bashrc}")
+        print(f"obsnote shell integration is already present in {rc}")
         return 0
-    with bashrc.open("a", encoding="utf-8") as fh:
+    with rc.open("a", encoding="utf-8") as fh:
         if existing and not existing.endswith("\n"):
             fh.write("\n")
-        fh.write(bash_init_block())
-    print(f"Added obsnote shell integration to {bashrc}")
-    print("Open a new shell, or run: source ~/.bashrc")
+        fh.write(shell_init_block(args.shell))
+    print(f"Added obsnote shell integration to {rc}")
+    print(f"Open a new shell, or run: source ~/{SHELL_RC[args.shell]}")
     return 0
 
 
@@ -994,7 +1215,7 @@ def check_ollama(settings: Settings) -> bool:
         return False
 
 
-def cmd_start(_: argparse.Namespace) -> int:
+def cmd_doctor(_: argparse.Namespace) -> int:
     def mark(ok: bool) -> str:
         return "[ok]" if ok else "[!!]"
 
@@ -1031,18 +1252,25 @@ def cmd_start(_: argparse.Namespace) -> int:
 
     if settings.vault is not None:
         page = resolve_target_page(None, settings)
-        active = load_last().get("active_page")
+        active, mismatched = active_page_for(settings)
         print(f"[ok] target page: {page} ({'active' if active else 'default'})")
+        if mismatched:
+            print(f"     (active page `{mismatched}` was set for a different vault and is ignored)")
 
-    bashrc = Path.home() / ".bashrc"
-    installed = bashrc.exists() and "obsnote shell integration" in bashrc.read_text(encoding="utf-8")
-    print(f"{mark(installed)} shell hook installed in ~/.bashrc")
+    installed_rcs = []
+    for rc_name in SHELL_RC.values():
+        rc = Path.home() / rc_name
+        if rc.exists() and "obsnote shell integration" in rc.read_text(encoding="utf-8"):
+            installed_rcs.append(f"~/{rc_name}")
+    installed = bool(installed_rcs)
+    where = f" ({', '.join(installed_rcs)})" if installed_rcs else ""
+    print(f"{mark(installed)} shell hook installed{where}")
     if not installed:
-        problems.append("Shell hook not installed. Run: obsnote shell-install bash")
+        problems.append("Shell hook not installed. Run: obsnote shell-install bash (or zsh)")
 
     print("[?]  shell hook active in *this* terminal -- can't be checked from a subprocess")
-    print('     Run this yourself: echo "$PROMPT_COMMAND"')
-    print("     It should contain __obsnote_prompt_command. If it doesn't: source ~/.bashrc,")
+    print('     Run this yourself: echo "$PROMPT_COMMAND"  (bash)  or  echo $precmd_functions  (zsh)')
+    print("     It should mention __obsnote. If it doesn't: source your shell rc file,")
     print("     or open a new terminal (the hook only activates when a shell starts).")
 
     paused = is_capture_paused()
@@ -1125,6 +1353,12 @@ def build_parser() -> argparse.ArgumentParser:
     since = sub.add_parser("since", help="append commands since a marker")
     since.add_argument("name", nargs="?")
     since.add_argument("--synth", action="store_true", help="append a local-LLM summary")
+    since.add_argument(
+        "--ok-only",
+        dest="ok_only",
+        action="store_true",
+        help="skip commands that exited nonzero (keeps annotations)",
+    )
     since.add_argument("--page", "-p", help="target page (defaults to the marker's page)")
     since.add_argument("--tag", "-t", action="append", default=[], help="inline #tag; repeatable")
     since.set_defaults(func=cmd_since)
@@ -1137,6 +1371,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     annotate.add_argument("text", nargs=argparse.REMAINDER)
     annotate.set_defaults(func=cmd_annotate)
+
+    summary = sub.add_parser(
+        "summary",
+        help="add a summary to the current mark session",
+        description="Reads stdin when text is omitted. The summary is rendered before the command "
+        "timeline the next time `since`/`marks <name>` renders a mark session.",
+    )
+    summary.add_argument("text", nargs=argparse.REMAINDER)
+    summary.set_defaults(func=cmd_summary)
 
     page = sub.add_parser("page", help="show, create, or switch the active page")
     page_sub = page.add_subparsers(dest="page_command")
@@ -1164,19 +1407,32 @@ def build_parser() -> argparse.ArgumentParser:
     tail.add_argument("-n", "--number", type=int, default=3, help="number of entries to show (default: 3)")
     tail.set_defaults(func=cmd_tail)
 
+    undo = sub.add_parser("undo", help="remove the last obsnote entry from a page")
+    undo.add_argument("--page", "-p", help="page to undo on (defaults to the active page)")
+    undo.set_defaults(func=cmd_undo)
+
+    forget = sub.add_parser(
+        "forget",
+        help="clear captured commands/output from obsnote's state file",
+        description="Clears what the shell hook has captured into local state (a shadow shell "
+        "history). Does not touch anything already written to the vault -- see `obsnote undo`.",
+    )
+    forget.add_argument("--last", type=int, metavar="N", help="forget only the N most recent captured commands")
+    forget.set_defaults(func=cmd_forget)
+
     shell_init = sub.add_parser("shell-init", help="print shell integration")
-    shell_init.add_argument("shell", choices=["bash"])
+    shell_init.add_argument("shell", choices=sorted(SHELL_INIT))
     shell_init.set_defaults(func=cmd_shell_init)
 
     shell_install = sub.add_parser("shell-install", help="install shell integration")
-    shell_install.add_argument("shell", choices=["bash"])
+    shell_install.add_argument("shell", choices=sorted(SHELL_INIT))
     shell_install.set_defaults(func=cmd_shell_install)
 
-    start = sub.add_parser("start", help="check that the vault, config, and shell hook are ready to go")
-    start.set_defaults(func=cmd_start)
+    doctor = sub.add_parser("doctor", help="check that the vault, config, and shell hook are ready to go")
+    doctor.set_defaults(func=cmd_doctor)
 
-    stop = sub.add_parser("stop", help="pause passive shell-history capture and confirm it's off")
-    stop.set_defaults(func=cmd_stop)
+    pause = sub.add_parser("pause", help="pause passive shell-history capture and confirm it's off")
+    pause.set_defaults(func=cmd_pause)
 
     resume = sub.add_parser("resume", help="resume passive shell-history capture")
     resume.set_defaults(func=cmd_resume)
@@ -1209,6 +1465,10 @@ def rewrite_legacy_args(argv: list[str]) -> list[str]:
         return ["since", *rest]
     if command == "synth-since":
         return ["since", *rest, "--synth"]
+    if command == "start":
+        return ["doctor", *rest]
+    if command == "stop":
+        return ["pause", *rest]
     return argv
 
 
@@ -1219,6 +1479,8 @@ def main(argv: list[str] | None = None) -> int:
     argv = rewrite_legacy_args(argv)
     if argv and argv[0] == "remember-cmd":
         remember = argparse.ArgumentParser(prog="obsnote remember-cmd")
+        remember.add_argument("--status", type=int, default=None, help="exit status of the command")
+        remember.add_argument("--cwd", default=None, help="directory the command ran in")
         remember.add_argument("command", nargs=argparse.REMAINDER)
         args = remember.parse_args(argv[1:])
         return cmd_remember_cmd(args)
