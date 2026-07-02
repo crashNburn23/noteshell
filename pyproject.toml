@@ -4,6 +4,9 @@ version = "0.1.0"
 description = "Capture shell commands, command output, notes, and local LLM summaries into an Obsidian vault."
 readme = "README.md"
 requires-python = ">=3.10"
+license = {file = "LICENSE"}
+authors = [{name = "crashNburn23"}]
+classifiers = ["License :: OSI Approved :: MIT License"]
 dependencies = []
 
 [project.scripts]

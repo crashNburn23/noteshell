@@ -123,3 +123,7 @@ without touching your global setup.
 Early, actively-changing personal tool. No test suite yet, no guarantees —
 if something breaks, `obsnote start` and `obsnote show` are your first stop
 for diagnosing it.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
