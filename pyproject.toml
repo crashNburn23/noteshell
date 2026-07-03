@@ -1,7 +1,7 @@
 [project]
 name = "obsnote"
 version = "0.2.0"
-description = "Capture shell commands, command output, notes, and local LLM summaries into an Obsidian vault."
+description = "Capture shell commands, command output, and notes into an Obsidian vault."
 readme = "README.md"
 requires-python = ">=3.10"
 license = {file = "LICENSE"}

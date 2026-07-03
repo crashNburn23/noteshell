@@ -8,8 +8,7 @@ import shlex
 import shutil
 import subprocess
 import sys
-import urllib.error
-import urllib.request
+import tempfile
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -20,8 +19,6 @@ from . import __version__
 
 APP_NAME = "obsnote"
 DEFAULT_NOTE = "Notebook/Linux.md"
-DEFAULT_OLLAMA_URL = "http://127.0.0.1:11434"
-DEFAULT_OLLAMA_MODEL = "llama3.1"
 DEFAULT_MAX_OUTPUT_CHARS = 40000
 DEFAULT_HISTORY_LIMIT = 2000
 PROJECT_CONFIG_NAME = ".obsnote.json"
@@ -55,8 +52,6 @@ ENTRY_HEADER_RE = re.compile(
 class Settings:
     vault: Path | None
     note: str
-    ollama_url: str
-    ollama_model: str
     max_output_chars: int
     redact_patterns: list[str]
 
@@ -145,12 +140,6 @@ def load_settings() -> Settings:
 
     vault_raw = os.environ.get("OBSNOTE_VAULT", project_cfg.get("vault", cfg.get("vault")))
     note = os.environ.get("OBSNOTE_NOTE", project_cfg.get("note", cfg.get("note", DEFAULT_NOTE)))
-    ollama_url = os.environ.get(
-        "OBSNOTE_OLLAMA_URL", project_cfg.get("ollama_url", cfg.get("ollama_url", DEFAULT_OLLAMA_URL))
-    )
-    ollama_model = os.environ.get(
-        "OBSNOTE_OLLAMA_MODEL", project_cfg.get("ollama_model", cfg.get("ollama_model", DEFAULT_OLLAMA_MODEL))
-    )
     max_output_raw = os.environ.get(
         "OBSNOTE_MAX_OUTPUT_CHARS",
         project_cfg.get("max_output_chars", cfg.get("max_output_chars", DEFAULT_MAX_OUTPUT_CHARS)),
@@ -171,8 +160,6 @@ def load_settings() -> Settings:
     return Settings(
         vault=Path(vault_raw).expanduser() if vault_raw else None,
         note=str(note),
-        ollama_url=str(ollama_url).rstrip("/"),
-        ollama_model=str(ollama_model),
         max_output_chars=max_output_chars,
         redact_patterns=redact_patterns,
     )
@@ -485,8 +472,6 @@ def cmd_config(args: argparse.Namespace) -> int:
     for attr, key in [
         ("vault", "vault"),
         ("note", "note"),
-        ("ollama_url", "ollama_url"),
-        ("ollama_model", "ollama_model"),
         ("max_output_chars", "max_output_chars"),
     ]:
         value = getattr(args, attr)
@@ -511,8 +496,6 @@ def cmd_config(args: argparse.Namespace) -> int:
         print(f"project config: {project_config}")
     print(f"vault: {settings.vault or '(unset)'}")
     print(f"note: {settings.note}")
-    print(f"ollama_url: {settings.ollama_url}")
-    print(f"ollama_model: {settings.ollama_model}")
     print(f"max_output_chars: {settings.max_output_chars}")
     print(f"redact_patterns: {', '.join(settings.redact_patterns)}")
     return 0
@@ -580,8 +563,8 @@ def cmd_pause(_: argparse.Namespace) -> int:
     print(f"Confirmed: capture_paused = {confirmed}")
     if confirmed:
         print("obsnote will not record anything typed at the shell until you run: obsnote resume")
-        print("(or `obsnote mark`, which turns capture back on too). Explicit commands")
-        print("(note/run/annotate) still work normally -- only the passive shell hook is paused.")
+        print("Explicit commands (note/run/annotate) still work normally -- only")
+        print("the passive shell hook is paused.")
     else:
         print("WARNING: could not confirm the paused state was saved. Check permissions on:")
         print(f"  {state_path()}")
@@ -695,7 +678,7 @@ def append_last_output(page: str, tags: str) -> Path:
 def cmd_run(args: argparse.Namespace) -> int:
     command_argv = strip_separator(args.command)
     if not command_argv:
-        raise SystemExit("Usage: obsnote run [--synth] -- <command> [args...]")
+        raise SystemExit("Usage: obsnote run -- <command> [args...]")
     command = shell_join(command_argv)
     try:
         proc = subprocess.Popen(
@@ -721,113 +704,8 @@ def cmd_run(args: argparse.Namespace) -> int:
     settings = load_settings()
     page = resolve_target_page(args.page, settings)
     tags = format_tags(args.tag)
-    if args.synth:
-        print(append_last_summary(page, tags))
-    else:
-        print(append_last_output(page, tags))
+    print(append_last_output(page, tags))
     return return_code
-
-
-def synthesize(settings: Settings, command: str, output: str) -> str:
-    clipped_output, _ = clip_output(output, settings.max_output_chars)
-    prompt = (
-        "You are writing a concise engineering note for an Obsidian notebook.\n"
-        "Summarize what the command did, the important result, errors or risks, "
-        "and any sensible next step. Keep it factual and compact.\n\n"
-        f"Command:\n{command}\n\nOutput:\n{clipped_output}\n"
-    )
-    payload = json.dumps(
-        {
-            "model": settings.ollama_model,
-            "prompt": prompt,
-            "stream": False,
-        }
-    ).encode("utf-8")
-    request = urllib.request.Request(
-        f"{settings.ollama_url}/api/generate",
-        data=payload,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=120) as response:
-            body = json.loads(response.read().decode("utf-8"))
-    except urllib.error.URLError as exc:
-        raise SystemExit(f"Ollama request failed: {exc}") from exc
-    except TimeoutError as exc:
-        raise SystemExit("Ollama request timed out.") from exc
-    text = clean_llm_response(body.get("response"))
-    if not text:
-        raise SystemExit(f"Ollama returned no response: {body}")
-    return text
-
-
-def clean_llm_response(text: Any) -> str:
-    if text is None:
-        return ""
-    cleaned = str(text).strip()
-    cleaned = re.sub(r"(?is)<think>.*?</think>\s*", "", cleaned).strip()
-    return cleaned
-
-
-def synthesize_history(settings: Settings, name: str, entries: list[dict[str, Any]]) -> str:
-    lines = []
-    for entry in entries:
-        if entry.get("type") == "note":
-            lines.append(f"- {entry['at']}: [note] {entry.get('text', '')}")
-        elif entry.get("type") == "summary":
-            lines.append(f"- {entry['at']}: [summary] {entry.get('text', '')}")
-        elif entry.get("type") == "skipped":
-            lines.append(f"- {entry['at']}: [skipped {entry.get('reason', 'unknown')} command]")
-        else:
-            lines.append(f"- {entry['at']}: {entry.get('command', '')}")
-    command_list = "\n".join(lines)
-    clipped_commands, _ = clip_output(command_list, settings.max_output_chars)
-    prompt = (
-        "You are writing a concise engineering note for an Obsidian notebook.\n"
-        "Summarize the terminal work since the named marker. Identify the likely goal, "
-        "important commands, results that can be inferred from the command sequence, "
-        "and sensible next steps. Do not invent command output that is not present.\n\n"
-        f"Marker: {name}\n\nCommands:\n{clipped_commands}\n"
-    )
-    payload = json.dumps(
-        {
-            "model": settings.ollama_model,
-            "prompt": prompt,
-            "stream": False,
-        }
-    ).encode("utf-8")
-    request = urllib.request.Request(
-        f"{settings.ollama_url}/api/generate",
-        data=payload,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=120) as response:
-            body = json.loads(response.read().decode("utf-8"))
-    except urllib.error.URLError as exc:
-        raise SystemExit(f"Ollama request failed: {exc}") from exc
-    except TimeoutError as exc:
-        raise SystemExit("Ollama request timed out.") from exc
-    text = clean_llm_response(body.get("response"))
-    if not text:
-        raise SystemExit(f"Ollama returned no response: {body}")
-    return text
-
-
-def append_last_summary(page: str, tags: str) -> Path:
-    settings = load_settings()
-    data = require_last_output()
-    command = data.get("command")
-    output = data.get("output")
-    summary = synthesize(settings, str(command), str(output))
-    markdown = (
-        f"{entry_footer(tags)}\n\n"
-        f"{fence(str(command), 'bash')}\n\n"
-        f"{summary}"
-    )
-    return append_markdown(settings, page, markdown)
 
 
 def set_marker(name: str, page: str) -> None:
@@ -848,7 +726,7 @@ def cmd_mark(args: argparse.Namespace) -> int:
     name = raw or next_auto_marker_name(markers(load_last()))
     if is_capture_paused():
         set_capture_paused(False)
-        print("capture: OFF -> ON (recording until `since`/`unmark`)", file=sys.stderr)
+        print("capture: OFF -> ON (recording until `since` or shell exit)", file=sys.stderr)
     set_marker(name, page)
     return 0
 
@@ -1005,23 +883,6 @@ def cmd_history_since(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_synth_since(args: argparse.Namespace) -> int:
-    settings = load_settings()
-    name = getattr(args, "_resolved_marker_name", None) or resolve_marker_arg(args.name)
-    marker, entries = since_entries(args, name)
-    summary = synthesize_history(settings, name, entries)
-    page = resolve_since_page(args, settings, marker)
-    tags = format_tags(args.tag)
-    markdown = (
-        f"{entry_footer(tags)}\n\n"
-        f"{summary}\n\n"
-        f"{format_session_markdown(entries)}"
-    )
-    path = append_markdown(settings, page, markdown)
-    print(path)
-    return 0
-
-
 def maybe_auto_pause_after_since(remaining_markers: int) -> None:
     if is_capture_paused():
         return
@@ -1032,21 +893,19 @@ def maybe_auto_pause_after_since(remaining_markers: int) -> None:
         )
         return
     set_capture_paused(True)
-    print("capture: ON -> OFF (auto-paused; run `obsnote resume` to keep recording)", file=sys.stderr)
+    print("capture: ON -> OFF (auto-paused; run `obsnote shell` to start another session)", file=sys.stderr)
 
 
 def cmd_since(args: argparse.Namespace) -> int:
     name = resolve_marker_arg(args.name)
     setattr(args, "_resolved_marker_name", name)
-    if args.preview and args.synth:
-        raise SystemExit("`obsnote since` cannot combine --preview and --synth.")
     if args.preview:
         marker, entries = since_entries(args, name)
         page = marker.get("page") or "(default)"
         print(f"--- commands since `{name}` (page: {page}, set {marker.get('at', 'unknown')}) ---\n")
         print(format_session_markdown(entries))
         return 0
-    result = cmd_synth_since(args) if args.synth else cmd_history_since(args)
+    result = cmd_history_since(args)
     remaining_markers = delete_marker(name)
     maybe_auto_pause_after_since(remaining_markers)
     return result
@@ -1111,7 +970,7 @@ def cmd_show(_: argparse.Namespace) -> int:
     settings = load_settings()
     data = load_last()
     paused = bool(data.get("capture_paused"))
-    print(f"capture: {'PAUSED (auto-resumes on `obsnote mark`, or run: obsnote resume)' if paused else 'active'}")
+    print(f"capture: {'PAUSED (run `obsnote shell` to start a capture session)' if paused else 'active'}")
     active, mismatched = active_page_for(settings, data)
     print(f"active page: {active or '(none, using default)'}")
     if mismatched:
@@ -1267,11 +1126,31 @@ __obsnote_precmd() {
 }
 
 autoload -Uz add-zsh-hook
-add-zsh-hook precmd __obsnote_precmd
+if (( ${precmd_functions[(Ie)__obsnote_precmd]} == 0 )); then
+  add-zsh-hook precmd __obsnote_precmd
+fi
 '''.strip()
 
 SHELL_INIT = {"bash": BASH_SHELL_INIT, "zsh": ZSH_SHELL_INIT}
 SHELL_RC = {"bash": ".bashrc", "zsh": ".zshrc"}
+SHELL_BIN = {"bash": "bash", "zsh": "zsh"}
+TEMP_SHELL_SHORT_COMMANDS = [
+    "annotate",
+    "config",
+    "doctor",
+    "forget",
+    "note",
+    "page",
+    "pause",
+    "resume",
+    "run",
+    "shell",
+    "show",
+    "since",
+    "summary",
+    "tail",
+    "undo",
+]
 
 
 def cmd_shell_init(args: argparse.Namespace) -> int:
@@ -1279,70 +1158,119 @@ def cmd_shell_init(args: argparse.Namespace) -> int:
     return 0
 
 
-def shell_init_block(shell: str) -> str:
-    return (
-        "\n# obsnote shell integration\n"
-        "if command -v obsnote >/dev/null 2>&1; then\n"
-        f'  eval "$(obsnote shell-init {shell})"\n'
-        "fi\n"
-    )
+def detect_shell() -> str:
+    shell = Path(os.environ.get("SHELL", "")).name
+    return shell if shell in SHELL_INIT else "bash"
 
 
-# Matches whatever shell_init_block() appended, regardless of which shell it
-# was installed for -- lets `shell-uninstall` clean it up even if it drifted
-# slightly from the exact string shell-install would write today.
-SHELL_INTEGRATION_BLOCK_RE = re.compile(
-    r"\n?# obsnote shell integration\n"
-    r"if command -v obsnote >/dev/null 2>&1; then\n"
-    r"  eval \"\$\(obsnote shell-init \w+\)\"\n"
-    r"fi\n"
-)
+def temp_shell_message(auto_mark: bool) -> str:
+    if auto_mark:
+        return "obsnote shell active. A marker is already open; run `obsnote since` to write it."
+    return "obsnote shell active. Run `obsnote mark` to start capture; exit returns to your normal shell."
 
 
-def cmd_shell_install(args: argparse.Namespace) -> int:
-    rc = Path.home() / SHELL_RC[args.shell]
-    existing = rc.read_text(encoding="utf-8") if rc.exists() else ""
-    marker = "obsnote shell integration"
-    if marker in existing:
-        print(f"obsnote shell integration is already present in {rc}")
-        return 0
-    with rc.open("a", encoding="utf-8") as fh:
-        if existing and not existing.endswith("\n"):
-            fh.write("\n")
-        fh.write(shell_init_block(args.shell))
-    set_capture_paused(True)
-    print(f"Added obsnote shell integration to {rc}")
-    print(f"Open a new shell, or run: source ~/{SHELL_RC[args.shell]}")
-    print("Passive capture is OFF by default. It turns on automatically when you run")
-    print("`obsnote mark`, and back off after `obsnote since`/`unmark` -- or run")
-    print("`obsnote resume` yourself to leave it recording continuously.")
-    return 0
+def temp_shell_shortcuts() -> str:
+    return "\n".join(f'{command}() {{ command obsnote {command} "$@"; }}' for command in TEMP_SHELL_SHORT_COMMANDS)
 
 
-def cmd_shell_uninstall(args: argparse.Namespace) -> int:
-    rc = Path.home() / SHELL_RC[args.shell]
-    if not rc.exists():
-        print(f"No {rc} found -- nothing to remove.")
-        return 0
-    text = rc.read_text(encoding="utf-8")
-    new_text, count = SHELL_INTEGRATION_BLOCK_RE.subn("", text)
-    if count == 0:
-        print(f"obsnote shell integration not found in {rc}")
-        return 0
-    rc.write_text(new_text, encoding="utf-8")
-    print(f"Removed obsnote shell integration from {rc}")
-    print(f"Open a new shell, or run: source ~/{SHELL_RC[args.shell]}")
-    print("Passive capture won't run anymore -- explicit commands (note/run/mark/...)")
-    print("still work normally.")
-    return 0
+def temp_bashrc(original_rc: Path, *, auto_mark: bool) -> str:
+    rc = shlex.quote(str(original_rc))
+    message = temp_shell_message(auto_mark)
+    lines = [
+        "# temporary obsnote shell",
+        f"if [ -r {rc} ]; then",
+        f"  source {rc}",
+        "fi",
+        'if command -v obsnote >/dev/null 2>&1; then',
+        '  eval "$(obsnote shell-init bash)"',
+        temp_shell_shortcuts(),
+        "fi",
+        f'printf "\\n{message}\\n"',
+    ]
+    return "\n".join(lines) + "\n"
 
 
-def check_ollama(settings: Settings) -> bool:
+def temp_zshrc(original_rc: Path, *, auto_mark: bool) -> str:
+    rc = shlex.quote(str(original_rc))
+    message = temp_shell_message(auto_mark)
+    lines = [
+        "# temporary obsnote shell",
+        f"if [[ -r {rc} ]]; then",
+        f"  source {rc}",
+        "fi",
+        "if command -v obsnote >/dev/null 2>&1; then",
+        '  eval "$(obsnote shell-init zsh)"',
+        temp_shell_shortcuts(),
+        "fi",
+        f'printf "\\n{message}\\n"',
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def confirm(prompt: str) -> bool:
     try:
-        with urllib.request.urlopen(f"{settings.ollama_url}/api/tags", timeout=2) as response:
-            return response.status == 200
-    except (urllib.error.URLError, TimeoutError, OSError):
+        answer = input(f"{prompt} [y/N] ").strip().lower()
+    except EOFError:
         return False
+    return answer in ("y", "yes")
+
+
+def finish_shell_marker(name: str) -> None:
+    if name not in markers(load_last()):
+        return
+    try:
+        _, entries = since_entries(argparse.Namespace(ok_only=False), name)
+    except SystemExit:
+        entries = []
+    if entries and confirm(f"Save commands from `{name}` with obsnote since before exiting?"):
+        args = argparse.Namespace(name=name, preview=False, ok_only=False, page=None, tag=[])
+        try:
+            cmd_since(args)
+            return
+        except SystemExit as exc:
+            print(exc, file=sys.stderr)
+    remaining_markers = delete_marker(name)
+    print(f"Deleted marker `{name}` (temporary shell exited without saving).")
+    if remaining_markers == 0 and not is_capture_paused():
+        set_capture_paused(True)
+        print("capture: ON -> OFF (auto-paused; no markers left)", file=sys.stderr)
+
+
+def cmd_shell(args: argparse.Namespace) -> int:
+    shell = args.shell or detect_shell()
+    binary = shutil.which(SHELL_BIN[shell])
+    if binary is None:
+        raise SystemExit(f"{shell} was not found on PATH.")
+    marker_name_started = ""
+    if args.no_mark:
+        if not markers(load_last()):
+            set_capture_paused(True)
+    else:
+        settings = load_settings()
+        page = resolve_target_page(args.page, settings)
+        marker_name_started = args.mark_name or next_auto_marker_name(markers(load_last()))
+        if is_capture_paused():
+            set_capture_paused(False)
+            print("capture: OFF -> ON (recording until `since` or shell exit)", file=sys.stderr)
+        set_marker(marker_name_started, page)
+    with tempfile.TemporaryDirectory(prefix="obsnote-shell-") as tmp:
+        tmpdir = Path(tmp)
+        env = os.environ.copy()
+        env["OBSNOTE_TEMP_SHELL"] = "1"
+        if shell == "bash":
+            rc = tmpdir / "bashrc"
+            rc.write_text(temp_bashrc(Path.home() / SHELL_RC["bash"], auto_mark=not args.no_mark), encoding="utf-8")
+            argv = [binary, "--rcfile", str(rc), "-i"]
+        else:
+            rc = tmpdir / ".zshrc"
+            rc.write_text(temp_zshrc(Path.home() / SHELL_RC["zsh"], auto_mark=not args.no_mark), encoding="utf-8")
+            env["ZDOTDIR"] = str(tmpdir)
+            argv = [binary, "-i"]
+        print(f"Starting temporary obsnote {shell} shell. Exit to return.")
+        code = subprocess.call(argv, env=env)
+    if marker_name_started:
+        finish_shell_marker(marker_name_started)
+    return code
 
 
 def cmd_doctor(_: argparse.Namespace) -> int:
@@ -1352,14 +1280,6 @@ def cmd_doctor(_: argparse.Namespace) -> int:
     problems: list[str] = []
     settings = load_settings()
     print("obsnote preflight check\n")
-
-    on_path = shutil.which("obsnote") is not None
-    print(f"{mark(on_path)} obsnote on PATH")
-    if not on_path:
-        problems.append(
-            "`obsnote` isn't on PATH. The shell hook checks `command -v obsnote` at shell "
-            "startup and silently skips installing itself if it's missing."
-        )
 
     if settings.vault is None:
         print("[!!] vault configured")
@@ -1387,31 +1307,17 @@ def cmd_doctor(_: argparse.Namespace) -> int:
         if mismatched:
             print(f"     (active page `{mismatched}` was set for a different vault and is ignored)")
 
-    installed_rcs = []
-    for rc_name in SHELL_RC.values():
-        rc = Path.home() / rc_name
-        if rc.exists() and "obsnote shell integration" in rc.read_text(encoding="utf-8"):
-            installed_rcs.append(f"~/{rc_name}")
-    installed = bool(installed_rcs)
-    where = f" ({', '.join(installed_rcs)})" if installed_rcs else ""
-    print(f"{mark(installed)} shell hook installed{where}")
-    if not installed:
-        problems.append("Shell hook not installed. Run: obsnote shell-install bash (or zsh)")
-
-    print("[?]  shell hook active in *this* terminal -- can't be checked from a subprocess")
-    print('     Run this yourself: echo "$PROMPT_COMMAND"  (bash)  or  echo $precmd_functions  (zsh)')
-    print("     It should mention __obsnote. If it doesn't: source your shell rc file,")
-    print("     or open a new terminal (the hook only activates when a shell starts).")
+    temp_shell = os.environ.get("OBSNOTE_TEMP_SHELL") == "1"
+    if temp_shell:
+        print("[ok] temporary obsnote shell active")
+    else:
+        print("[--] not currently inside `obsnote shell`")
 
     paused = is_capture_paused()
     if paused:
-        print("[--] capture is PAUSED (default) -- turns on automatically with `obsnote mark`,")
-        print("     or run: obsnote resume")
+        print("[--] capture is paused")
     else:
         print("[ok] capture is active (not paused)")
-
-    ollama_ok = check_ollama(settings)
-    print(f"{mark(ollama_ok)} ollama reachable at {settings.ollama_url} (only needed for --synth)")
 
     print()
     if problems:
@@ -1419,7 +1325,7 @@ def cmd_doctor(_: argparse.Namespace) -> int:
         for problem in problems:
             print(f"  - {problem}")
         return 1
-    print("Config, vault, and shell-hook install all look good.")
+    print("Config and vault look good.")
     return 0
 
 
@@ -1431,8 +1337,6 @@ def build_parser() -> argparse.ArgumentParser:
     config = sub.add_parser("config", help="show or update configuration")
     config.add_argument("--vault")
     config.add_argument("--note")
-    config.add_argument("--ollama-url")
-    config.add_argument("--ollama-model")
     config.add_argument("--max-output-chars", type=int)
     config.add_argument(
         "--redact-pattern",
@@ -1453,28 +1357,15 @@ def build_parser() -> argparse.ArgumentParser:
     note.set_defaults(func=cmd_note)
 
     run = sub.add_parser("run", help="run a command, capture output, and append it")
-    run.add_argument("--synth", action="store_true", help="append a local-LLM summary instead of raw output")
     run.add_argument("--page", "-p", help="target page for this entry only")
     run.add_argument("--tag", "-t", action="append", default=[], help="inline #tag; repeatable")
     run.add_argument("command", nargs=argparse.REMAINDER)
     run.set_defaults(func=cmd_run)
 
-    mark = sub.add_parser("mark", help="set a command-history marker")
-    mark.add_argument("name", nargs="?", help="marker name (defaults to an auto-numbered '1', '2', ...)")
-    mark.add_argument("--page", "-p", help="page this marker belongs to (defaults to the active page)")
-    mark.set_defaults(func=cmd_mark)
-
-    unmark = sub.add_parser("unmark", help="delete a marker")
-    unmark.add_argument(
-        "name", nargs="?", help="marker name (defaults to 'default', or the only marker if just one exists)"
-    )
-    unmark.set_defaults(func=cmd_mark_del)
-
     since = sub.add_parser("since", help="append commands since a marker")
     since.add_argument(
         "name", nargs="?", help="marker name (defaults to 'default', or the only marker if just one exists)"
     )
-    since.add_argument("--synth", action="store_true", help="append a local-LLM summary")
     since.add_argument("--preview", action="store_true", help="render pending commands without writing or closing marker")
     since.add_argument(
         "--ok-only",
@@ -1488,7 +1379,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     annotate = sub.add_parser(
         "annotate",
-        help="insert a note into the command timeline, e.g. between commands in a mark session",
+        help="insert a note into the current shell-session timeline",
         description="Reads stdin when text is omitted. Shows up inline (as a comment) the next time "
         "`since`/`since --preview` renders the commands recorded around it.",
     )
@@ -1497,9 +1388,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     summary = sub.add_parser(
         "summary",
-        help="add a summary to the current mark session",
+        help="add a summary to the current shell session",
         description="Reads stdin when text is omitted. The summary is rendered before the command "
-        "timeline the next time `since`/`since --preview` renders a mark session.",
+        "timeline the next time `since`/`since --preview` renders a shell session.",
     )
     summary.add_argument("text", nargs=argparse.REMAINDER)
     summary.set_defaults(func=cmd_summary)
@@ -1543,19 +1434,14 @@ def build_parser() -> argparse.ArgumentParser:
     forget.add_argument("--last", type=int, metavar="N", help="forget only the N most recent captured commands")
     forget.set_defaults(func=cmd_forget)
 
-    shell_init = sub.add_parser("shell-init", help="print shell integration")
-    shell_init.add_argument("shell", choices=sorted(SHELL_INIT))
-    shell_init.set_defaults(func=cmd_shell_init)
+    shell = sub.add_parser("shell", help="start a temporary obsnote-enabled shell")
+    shell.add_argument("--mark", dest="mark_name", help="marker name to start automatically (default: auto-numbered)")
+    shell.add_argument("--page", "-p", help="page the automatic marker belongs to")
+    shell.add_argument("--no-mark", action="store_true", help="start the temporary hook without creating a marker")
+    shell.add_argument("shell", nargs="?", choices=sorted(SHELL_INIT), help="shell to start (default: $SHELL, or bash)")
+    shell.set_defaults(func=cmd_shell)
 
-    shell_install = sub.add_parser("shell-install", help="install shell integration")
-    shell_install.add_argument("shell", choices=sorted(SHELL_INIT))
-    shell_install.set_defaults(func=cmd_shell_install)
-
-    shell_uninstall = sub.add_parser("shell-uninstall", help="remove shell integration installed via shell-install")
-    shell_uninstall.add_argument("shell", choices=sorted(SHELL_INIT))
-    shell_uninstall.set_defaults(func=cmd_shell_uninstall)
-
-    doctor = sub.add_parser("doctor", help="check that the vault, config, and shell hook are ready to go")
+    doctor = sub.add_parser("doctor", help="check vault, config, and current obsnote shell state")
     doctor.set_defaults(func=cmd_doctor)
 
     pause = sub.add_parser("pause", help="pause passive shell-history capture and confirm it's off")
@@ -1580,5 +1466,21 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_remember_cmd(args)
     if argv and argv[0] == "recording-status":
         return cmd_recording_status(argparse.Namespace())
+    if argv and argv[0] == "shell-init":
+        shell_init = argparse.ArgumentParser(prog="obsnote shell-init")
+        shell_init.add_argument("shell", choices=sorted(SHELL_INIT))
+        args = shell_init.parse_args(argv[1:])
+        return cmd_shell_init(args)
+    if argv and argv[0] == "mark":
+        mark = argparse.ArgumentParser(prog="obsnote mark")
+        mark.add_argument("name", nargs="?")
+        mark.add_argument("--page", "-p")
+        args = mark.parse_args(argv[1:])
+        return cmd_mark(args)
+    if argv and argv[0] == "unmark":
+        unmark = argparse.ArgumentParser(prog="obsnote unmark")
+        unmark.add_argument("name", nargs="?")
+        args = unmark.parse_args(argv[1:])
+        return cmd_mark_del(args)
     args = parser.parse_args(argv)
     return int(args.func(args))

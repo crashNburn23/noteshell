@@ -186,32 +186,121 @@ class CliTest(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn("capture_paused = True", stdout)
 
-    def test_shell_install_leaves_capture_paused_by_default(self) -> None:
+    def test_shell_starts_marked_temporary_bash_session_and_discards_on_exit(self) -> None:
+        self.write_config(vault=str(self.vault), note="notes.md")
         home = self.root / "home"
         home.mkdir()
-        with mock.patch.object(cli.Path, "home", return_value=home):
-            code, stdout, _ = self.run_cli("shell-install", "bash")
+        (home / ".bashrc").write_text("alias ll='ls -l'\n", encoding="utf-8")
+        launched: dict[str, object] = {}
+
+        def fake_call(argv: list[str], env: dict[str, str]) -> int:
+            rc = Path(argv[2])
+            launched["argv"] = argv
+            launched["env"] = env
+            launched["rc_text"] = rc.read_text(encoding="utf-8")
+            self.assertTrue(rc.exists())
+            return 17
+
+        with (
+            mock.patch.object(cli.Path, "home", return_value=home),
+            mock.patch.object(cli.shutil, "which", return_value="/bin/bash"),
+            mock.patch.object(cli.subprocess, "call", side_effect=fake_call),
+            mock.patch("builtins.input", return_value="n"),
+        ):
+            code, stdout, _ = self.run_cli("shell", "--mark", "lab", "bash")
+
+        self.assertEqual(code, 17)
+        self.assertIn("Marked `lab`", stdout)
+        self.assertIn("Starting temporary obsnote bash shell", stdout)
+        self.assertIn("Deleted marker `lab`", stdout)
+        self.assertEqual(launched["argv"], ["/bin/bash", "--rcfile", launched["argv"][2], "-i"])
+        self.assertEqual(launched["env"]["OBSNOTE_TEMP_SHELL"], "1")
+        self.assertIn("source", str(launched["rc_text"]))
+        self.assertIn("obsnote shell-init bash", str(launched["rc_text"]))
+        self.assertIn('since() { command obsnote since "$@"; }', str(launched["rc_text"]))
+        self.assertIn('page() { command obsnote page "$@"; }', str(launched["rc_text"]))
+        state = self.read_state()
+        self.assertTrue(state["capture_paused"])
+        self.assertEqual(state["markers"], {})
+
+    def test_shell_exit_can_save_pending_session_with_since(self) -> None:
+        self.write_config(vault=str(self.vault), note="notes.md")
+        home = self.root / "home"
+        home.mkdir()
+
+        def fake_call(argv: list[str], env: dict[str, str]) -> int:
+            self.run_cli("remember-cmd", "--", "echo from shell")
+            return 0
+
+        with (
+            mock.patch.object(cli.Path, "home", return_value=home),
+            mock.patch.object(cli.shutil, "which", return_value="/bin/bash"),
+            mock.patch.object(cli.subprocess, "call", side_effect=fake_call),
+            mock.patch("builtins.input", return_value="y"),
+        ):
+            code, stdout, _ = self.run_cli("shell", "--mark", "lab", "bash")
+
         self.assertEqual(code, 0)
-        self.assertIn("OFF by default", stdout)
-        self.assertTrue(self.read_state()["capture_paused"])
+        self.assertIn(str(self.vault / "notes.md"), stdout)
+        text = (self.vault / "notes.md").read_text(encoding="utf-8")
+        self.assertIn("echo from shell", text)
+        state = self.read_state()
+        self.assertEqual(state.get("markers"), {})
+        self.assertTrue(state["capture_paused"])
 
-    def test_shell_uninstall_removes_the_installed_block(self) -> None:
+    def test_shell_no_mark_starts_temporary_zsh_hook_paused(self) -> None:
         home = self.root / "home"
         home.mkdir()
-        with mock.patch.object(cli.Path, "home", return_value=home):
-            self.run_cli("shell-install", "bash")
-            rc_before = (home / ".bashrc").read_text(encoding="utf-8")
-            self.assertIn("obsnote shell integration", rc_before)
+        launched: dict[str, object] = {}
 
-            code, stdout, _ = self.run_cli("shell-uninstall", "bash")
-            self.assertEqual(code, 0)
-            self.assertIn("Removed obsnote shell integration", stdout)
-            rc_after = (home / ".bashrc").read_text(encoding="utf-8")
-            self.assertNotIn("obsnote shell integration", rc_after)
+        def fake_call(argv: list[str], env: dict[str, str]) -> int:
+            rc = Path(env["ZDOTDIR"]) / ".zshrc"
+            launched["argv"] = argv
+            launched["env"] = env
+            launched["rc_text"] = rc.read_text(encoding="utf-8")
+            self.assertTrue(rc.exists())
+            return 0
 
-            code, stdout, _ = self.run_cli("shell-uninstall", "bash")
-            self.assertEqual(code, 0)
-            self.assertIn("not found", stdout)
+        with (
+            mock.patch.object(cli.Path, "home", return_value=home),
+            mock.patch.object(cli.shutil, "which", return_value="/bin/zsh"),
+            mock.patch.object(cli.subprocess, "call", side_effect=fake_call),
+        ):
+            code, stdout, _ = self.run_cli("shell", "--no-mark", "zsh")
+
+        self.assertEqual(code, 0)
+        self.assertIn("Starting temporary obsnote zsh shell", stdout)
+        self.assertEqual(launched["argv"], ["/bin/zsh", "-i"])
+        self.assertEqual(launched["env"]["OBSNOTE_TEMP_SHELL"], "1")
+        self.assertIn("obsnote shell-init zsh", str(launched["rc_text"]))
+        self.assertIn('pause() { command obsnote pause "$@"; }', str(launched["rc_text"]))
+        state = self.read_state()
+        self.assertTrue(state["capture_paused"])
+        self.assertNotIn("markers", state)
+
+    def test_shell_install_and_uninstall_are_removed(self) -> None:
+        for name in ("shell-install", "shell-uninstall"):
+            with self.assertRaises(SystemExit):
+                self.run_cli(name, "bash")
+
+    def test_public_help_omits_internal_and_removed_commands(self) -> None:
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with (
+            contextlib.redirect_stdout(stdout),
+            contextlib.redirect_stderr(stderr),
+            self.assertRaises(SystemExit) as raised,
+        ):
+            cli.main(["--help"])
+
+        self.assertEqual(raised.exception.code, 0)
+        text = stdout.getvalue()
+        self.assertNotIn("shell-install", text)
+        self.assertNotIn("shell-uninstall", text)
+        self.assertNotIn("shell-init", text)
+        self.assertNotIn(" mark ", text)
+        self.assertNotIn("unmark", text)
+        self.assertNotIn("synth", text)
 
     def test_mark_auto_resumes_and_since_auto_pauses_capture(self) -> None:
         self.write_config(vault=str(self.vault), note="notes.md")
@@ -330,6 +419,17 @@ class CliTest(unittest.TestCase):
         code, stdout, _ = self.run_cli("doctor")
         self.assertIn("obsnote preflight check", stdout)
 
+    def test_doctor_accepts_temporary_shell(self) -> None:
+        self.write_config(vault=str(self.vault), note="notes.md")
+        with (
+            mock.patch.dict(os.environ, {"OBSNOTE_TEMP_SHELL": "1"}, clear=False),
+            mock.patch.object(cli.shutil, "which", return_value="/usr/bin/obsnote"),
+        ):
+            code, stdout, _ = self.run_cli("doctor")
+
+        self.assertEqual(code, 0)
+        self.assertIn("temporary obsnote shell active", stdout)
+
     def test_legacy_aliases_are_removed(self) -> None:
         for name in ("start", "stop", "last", "synth", "history-since", "mark-list", "save"):
             with self.assertRaises(SystemExit):
@@ -339,6 +439,11 @@ class CliTest(unittest.TestCase):
         self.write_config(vault=str(self.vault), note="notes.md")
         with self.assertRaises(SystemExit):
             self.run_cli("run", "--no-append", "--", "echo", "hi")
+
+    def test_run_synth_option_is_removed(self) -> None:
+        self.write_config(vault=str(self.vault), note="notes.md")
+        with self.assertRaises(SystemExit):
+            self.run_cli("run", "--synth", "--", "echo", "hi")
 
     def test_undo_removes_only_last_entry(self) -> None:
         self.write_config(vault=str(self.vault), note="notes.md")
