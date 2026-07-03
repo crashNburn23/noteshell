@@ -1,4 +1,4 @@
-"""obsnote package."""
+"""noteshell package."""
 
 __all__ = ["__version__"]
 

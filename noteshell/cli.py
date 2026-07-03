@@ -17,16 +17,16 @@ from typing import Any
 from . import __version__
 
 
-APP_NAME = "obsnote"
+APP_NAME = "noteshell"
 DEFAULT_NOTE = "Notebook/Linux.md"
 DEFAULT_MAX_OUTPUT_CHARS = 40000
 DEFAULT_HISTORY_LIMIT = 2000
-PROJECT_CONFIG_NAME = ".obsnote.json"
+PROJECT_CONFIG_NAME = ".noteshell.json"
 
 # Case-insensitive patterns checked against typed shell commands before they're
 # passively recorded via the PROMPT_COMMAND hook. A match means the command is
 # dropped silently (never written to state or the vault). Extend via
-# `obsnote config --redact-pattern <regex>`.
+# `noteshell config --redact-pattern <regex>`.
 #
 # These require an actual value attached (KEY=value, -pVALUE, "Bearer xyz", ...)
 # rather than bare keywords -- matching on the word "token" or "secret" alone is
@@ -40,11 +40,12 @@ DEFAULT_REDACT_PATTERNS = [
     r"-----BEGIN [A-Z ]*PRIVATE KEY-----",
 ]
 
-# Matches the start of an entry on a page: the current `From obsnote: <timestamp>`
-# footer line, or the pre-9d9d741 "`command` _timestamp_" header still present in
-# older vault pages.
+# Matches the start of an entry on a page: the current `From noteshell: <timestamp>`
+# footer line, the `From obsnote: <timestamp>` footer this tool wrote before the
+# noteshell rename, or the pre-9d9d741 "`command` _timestamp_" header still present
+# in older vault pages.
 ENTRY_HEADER_RE = re.compile(
-    r"(?m)^(?:From obsnote: \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} [+-]\d{4}.*|`[^`\n]+`\s+_[^_\n]+_.*)$"
+    r"(?m)^(?:From (?:noteshell|obsnote): \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} [+-]\d{4}.*|`[^`\n]+`\s+_[^_\n]+_.*)$"
 )
 
 
@@ -138,10 +139,10 @@ def load_settings() -> Settings:
     project_config = find_project_config(safe_cwd())
     project_cfg = load_json(project_config) if project_config else {}
 
-    vault_raw = os.environ.get("OBSNOTE_VAULT", project_cfg.get("vault", cfg.get("vault")))
-    note = os.environ.get("OBSNOTE_NOTE", project_cfg.get("note", cfg.get("note", DEFAULT_NOTE)))
+    vault_raw = os.environ.get("NOTESHELL_VAULT", project_cfg.get("vault", cfg.get("vault")))
+    note = os.environ.get("NOTESHELL_NOTE", project_cfg.get("note", cfg.get("note", DEFAULT_NOTE)))
     max_output_raw = os.environ.get(
-        "OBSNOTE_MAX_OUTPUT_CHARS",
+        "NOTESHELL_MAX_OUTPUT_CHARS",
         project_cfg.get("max_output_chars", cfg.get("max_output_chars", DEFAULT_MAX_OUTPUT_CHARS)),
     )
 
@@ -167,7 +168,7 @@ def load_settings() -> Settings:
 
 def resolve_note_path(settings: Settings, note: str) -> Path:
     if settings.vault is None:
-        raise SystemExit("No Obsidian vault configured. Run: obsnote config --vault /path/to/vault")
+        raise SystemExit("No Obsidian vault configured. Run: noteshell config --vault /path/to/vault")
     note_path = Path(note)
     if note_path.is_absolute() or ".." in note_path.parts:
         raise SystemExit("Notebook path must be relative to the vault and may not contain '..'")
@@ -179,7 +180,7 @@ def now_stamp() -> str:
 
 
 def entry_footer(tags: str = "") -> str:
-    footer = f"From obsnote: {now_stamp()}"
+    footer = f"From noteshell: {now_stamp()}"
     if tags:
         footer = f"{footer} {tags}"
     return footer
@@ -282,7 +283,7 @@ def clip_output(output: str, limit: int) -> tuple[str, bool]:
     tail_len = limit - head_len
     clipped = (
         output[:head_len]
-        + f"\n\n[obsnote clipped {len(output) - limit} characters]\n\n"
+        + f"\n\n[noteshell clipped {len(output) - limit} characters]\n\n"
         + output[-tail_len:]
     )
     return clipped, True
@@ -461,7 +462,7 @@ def require_last_output() -> dict[str, Any]:
     if not data.get("command") or data.get("output") is None:
         raise SystemExit(
             "No captured command output found yet.\n"
-            "Run a command through obsnote first, for example: obsnote run -- ls -la"
+            "Run a command through noteshell first, for example: noteshell run -- ls -la"
         )
     return data
 
@@ -506,7 +507,7 @@ def cmd_note(args: argparse.Namespace) -> int:
     text_argv = strip_separator(args.text)
     if any(tok in ("--page", "-p", "--tag", "-t") for tok in text_argv):
         print(
-            "obsnote note: warning: --page/--tag found inside the note text -- flags are only "
+            "noteshell note: warning: --page/--tag found inside the note text -- flags are only "
             "recognized before the text, so this was written as literal words.",
             file=sys.stderr,
         )
@@ -562,7 +563,7 @@ def cmd_pause(_: argparse.Namespace) -> int:
     print("Pausing passive shell-history capture...")
     print(f"Confirmed: capture_paused = {confirmed}")
     if confirmed:
-        print("obsnote will not record anything typed at the shell until you run: obsnote resume")
+        print("noteshell will not record anything typed at the shell until you run: noteshell resume")
         print("Explicit commands (note/run/annotate) still work normally -- only")
         print("the passive shell hook is paused.")
     else:
@@ -597,7 +598,7 @@ def cmd_forget(args: argparse.Namespace) -> int:
         )
     data["updated_at"] = now_stamp()
     save_json(state_path(), data)
-    print("Nothing already written to the vault was touched -- `obsnote undo` removes vault entries.")
+    print("Nothing already written to the vault was touched -- `noteshell undo` removes vault entries.")
     return 0
 
 
@@ -610,7 +611,7 @@ def cmd_undo(args: argparse.Namespace) -> int:
     text = path.read_text(encoding="utf-8")
     matches = list(ENTRY_HEADER_RE.finditer(text))
     if not matches:
-        raise SystemExit(f"No obsnote entries found in {page}.")
+        raise SystemExit(f"No noteshell entries found in {page}.")
     start = matches[-1].start()
     removed = text[start:].rstrip()
     remaining = text[:start].rstrip()
@@ -662,7 +663,7 @@ def append_last_output(page: str, tags: str) -> Path:
     command = data.get("command")
     output = data.get("output")
     output, clipped = clip_output(str(output), settings.max_output_chars)
-    clipped_note = "\n\n_Output clipped by obsnote._" if clipped else ""
+    clipped_note = "\n\n_Output clipped by noteshell._" if clipped else ""
     return_code = data.get("return_code")
     exit_note = f"\n\n_Exited with code {return_code}._" if isinstance(return_code, int) and return_code != 0 else ""
     markdown = (
@@ -678,7 +679,7 @@ def append_last_output(page: str, tags: str) -> Path:
 def cmd_run(args: argparse.Namespace) -> int:
     command_argv = strip_separator(args.command)
     if not command_argv:
-        raise SystemExit("Usage: obsnote run -- <command> [args...]")
+        raise SystemExit("Usage: noteshell run -- <command> [args...]")
     command = shell_join(command_argv)
     try:
         proc = subprocess.Popen(
@@ -690,7 +691,7 @@ def cmd_run(args: argparse.Namespace) -> int:
             errors="replace",
         )
     except OSError as exc:
-        raise SystemExit(f"obsnote run: {exc}") from exc
+        raise SystemExit(f"noteshell run: {exc}") from exc
     chunks: list[str] = []
     assert proc.stdout is not None
     for line in proc.stdout:
@@ -810,7 +811,7 @@ def format_history_markdown(entries: list[dict[str, Any]]) -> str:
         elif entry.get("type") == "summary":
             continue
         elif entry.get("type") == "skipped":
-            command_lines.append(f"# obsnote skipped a {entry.get('reason', 'unknown')} command")
+            command_lines.append(f"# noteshell skipped a {entry.get('reason', 'unknown')} command")
         else:
             cwd = entry.get("cwd")
             if annotate_cwd and isinstance(cwd, str) and cwd != current_cwd:
@@ -888,12 +889,12 @@ def maybe_auto_pause_after_since(remaining_markers: int) -> None:
         return
     if remaining_markers > 0:
         print(
-            "capture: staying ON -- other markers are still pending (run `obsnote pause` if you're done)",
+            "capture: staying ON -- other markers are still pending (run `noteshell pause` if you're done)",
             file=sys.stderr,
         )
         return
     set_capture_paused(True)
-    print("capture: ON -> OFF (auto-paused; run `obsnote shell` to start another session)", file=sys.stderr)
+    print("capture: ON -> OFF (auto-paused; run `noteshell shell` to start another session)", file=sys.stderr)
 
 
 def cmd_since(args: argparse.Namespace) -> int:
@@ -917,7 +918,7 @@ def cmd_page_new(args: argparse.Namespace) -> int:
     path = resolve_note_path(settings, page)
     if path.exists():
         raise SystemExit(
-            f"Page already exists: {page}\nUse `obsnote page use {page}` to switch to it."
+            f"Page already exists: {page}\nUse `noteshell page use {page}` to switch to it."
         )
     title = args.title or Path(page).stem.replace("_", " ").replace("-", " ")
     tags = format_tags(args.tag)
@@ -935,7 +936,7 @@ def cmd_page_use(args: argparse.Namespace) -> int:
     page = normalize_page_name(args.name)
     path = resolve_note_path(settings, page)
     if not path.exists():
-        raise SystemExit(f"No such page: {page}\nUse `obsnote page new {page}` to create it.")
+        raise SystemExit(f"No such page: {page}\nUse `noteshell page new {page}` to create it.")
     set_active_page(page, settings)
     print(f"Active page: {page}")
     return 0
@@ -954,7 +955,7 @@ def cmd_page_show(_: argparse.Namespace) -> int:
 def cmd_pages(_: argparse.Namespace) -> int:
     settings = load_settings()
     if settings.vault is None:
-        raise SystemExit("No Obsidian vault configured. Run: obsnote config --vault /path/to/vault")
+        raise SystemExit("No Obsidian vault configured. Run: noteshell config --vault /path/to/vault")
     active, _ = active_page_for(settings)
     files = sorted(p.relative_to(settings.vault).as_posix() for p in settings.vault.rglob("*.md"))
     if not files:
@@ -970,7 +971,7 @@ def cmd_show(_: argparse.Namespace) -> int:
     settings = load_settings()
     data = load_last()
     paused = bool(data.get("capture_paused"))
-    print(f"capture: {'PAUSED (run `obsnote shell` to start a capture session)' if paused else 'active'}")
+    print(f"capture: {'PAUSED (run `noteshell shell` to start a capture session)' if paused else 'active'}")
     active, mismatched = active_page_for(settings, data)
     print(f"active page: {active or '(none, using default)'}")
     if mismatched:
@@ -987,7 +988,7 @@ def cmd_show(_: argparse.Namespace) -> int:
             print("last output preview:")
             print(preview)
             if clipped:
-                print("[preview truncated; obsnote run writes the full capture]")
+                print("[preview truncated; noteshell run writes the full capture]")
     else:
         print("no command captured yet")
     all_markers = markers(data)
@@ -1049,85 +1050,85 @@ def cmd_tail(args: argparse.Namespace) -> int:
 
 BASH_SHELL_INIT = r'''
 # Keep compound/pasted multiline commands as one history entry with literal
-# newlines, so obsnote captures the command the way it was typed.
+# newlines, so noteshell captures the command the way it was typed.
 shopt -s cmdhist lithist
 
 # A leading space on a typed command keeps it out of bash history entirely
-# (and therefore out of obsnote's capture too) -- the standard bash convention
-# for "don't record this". obsnote turns it on if it isn't already.
+# (and therefore out of noteshell's capture too) -- the standard bash convention
+# for "don't record this". noteshell turns it on if it isn't already.
 case ";$HISTCONTROL;" in
   *";ignorespace;"*|*";ignoreboth;"*) ;;
   *) HISTCONTROL="${HISTCONTROL:+$HISTCONTROL:}ignorespace" ;;
 esac
 export HISTCONTROL
 
-__obsnote_prompt_command() {
+__noteshell_prompt_command() {
   local last_status=$?
   local cmd
   cmd="$(HISTTIMEFORMAT= fc -ln -1 2>/dev/null | sed '1s/^[[:space:]]*//')"
   case "$cmd" in
-    ""|obsnote*) ;;
+    ""|noteshell*) ;;
     *)
-      if obsnote remember-cmd --status "$last_status" --cwd "$PWD" -- "$cmd" >/dev/null 2>&1; then
-        rm -f "${XDG_STATE_HOME:-$HOME/.local/state}/obsnote/hook-error.txt" 2>/dev/null || true
+      if noteshell remember-cmd --status "$last_status" --cwd "$PWD" -- "$cmd" >/dev/null 2>&1; then
+        rm -f "${XDG_STATE_HOME:-$HOME/.local/state}/noteshell/hook-error.txt" 2>/dev/null || true
       else
-        mkdir -p "${XDG_STATE_HOME:-$HOME/.local/state}/obsnote" 2>/dev/null || true
-        printf "remember-cmd failed with exit %s; run obsnote doctor or obsnote show\n" "$?" > "${XDG_STATE_HOME:-$HOME/.local/state}/obsnote/hook-error.txt" 2>/dev/null || true
+        mkdir -p "${XDG_STATE_HOME:-$HOME/.local/state}/noteshell" 2>/dev/null || true
+        printf "remember-cmd failed with exit %s; run noteshell doctor or noteshell show\n" "$?" > "${XDG_STATE_HOME:-$HOME/.local/state}/noteshell/hook-error.txt" 2>/dev/null || true
       fi
       ;;
   esac
-  if [ -z "${__OBSNOTE_ORIGINAL_PS1+x}" ]; then
-    __OBSNOTE_ORIGINAL_PS1="$PS1"
+  if [ -z "${__NOTESHELL_ORIGINAL_PS1+x}" ]; then
+    __NOTESHELL_ORIGINAL_PS1="$PS1"
   fi
-  if obsnote recording-status >/dev/null 2>&1; then
-    PS1="[\[\e[31m\]●\[\e[0m\] rec] $__OBSNOTE_ORIGINAL_PS1"
+  if noteshell recording-status >/dev/null 2>&1; then
+    PS1="[\[\e[31m\]●\[\e[0m\] rec] $__NOTESHELL_ORIGINAL_PS1"
   else
-    PS1="$__OBSNOTE_ORIGINAL_PS1"
+    PS1="$__NOTESHELL_ORIGINAL_PS1"
   fi
   return $last_status
 }
 
 case ";$PROMPT_COMMAND;" in
-  *";__obsnote_prompt_command;"*) ;;
-  *) PROMPT_COMMAND="__obsnote_prompt_command${PROMPT_COMMAND:+;$PROMPT_COMMAND}" ;;
+  *";__noteshell_prompt_command;"*) ;;
+  *) PROMPT_COMMAND="__noteshell_prompt_command${PROMPT_COMMAND:+;$PROMPT_COMMAND}" ;;
 esac
 '''.strip()
 
 # `status` is a read-only special parameter in zsh, hence `last_status`.
 ZSH_SHELL_INIT = r'''
 # A leading space on a typed command keeps it out of zsh history entirely
-# (and therefore out of obsnote's capture too).
+# (and therefore out of noteshell's capture too).
 setopt hist_ignore_space
 
-__obsnote_precmd() {
+__noteshell_precmd() {
   local last_status=$?
   local cmd
   cmd="$(fc -ln -1 2>/dev/null | sed '1s/^[[:space:]]*//')"
   case "$cmd" in
-    ""|obsnote*) ;;
+    ""|noteshell*) ;;
     *)
-      if obsnote remember-cmd --status "$last_status" --cwd "$PWD" -- "$cmd" >/dev/null 2>&1; then
-        rm -f "${XDG_STATE_HOME:-$HOME/.local/state}/obsnote/hook-error.txt" 2>/dev/null || true
+      if noteshell remember-cmd --status "$last_status" --cwd "$PWD" -- "$cmd" >/dev/null 2>&1; then
+        rm -f "${XDG_STATE_HOME:-$HOME/.local/state}/noteshell/hook-error.txt" 2>/dev/null || true
       else
-        mkdir -p "${XDG_STATE_HOME:-$HOME/.local/state}/obsnote" 2>/dev/null || true
-        printf "remember-cmd failed with exit %s; run obsnote doctor or obsnote show\n" "$?" > "${XDG_STATE_HOME:-$HOME/.local/state}/obsnote/hook-error.txt" 2>/dev/null || true
+        mkdir -p "${XDG_STATE_HOME:-$HOME/.local/state}/noteshell" 2>/dev/null || true
+        printf "remember-cmd failed with exit %s; run noteshell doctor or noteshell show\n" "$?" > "${XDG_STATE_HOME:-$HOME/.local/state}/noteshell/hook-error.txt" 2>/dev/null || true
       fi
       ;;
   esac
-  if [[ -z ${__OBSNOTE_ORIGINAL_PROMPT+x} ]]; then
-    __OBSNOTE_ORIGINAL_PROMPT="$PROMPT"
+  if [[ -z ${__NOTESHELL_ORIGINAL_PROMPT+x} ]]; then
+    __NOTESHELL_ORIGINAL_PROMPT="$PROMPT"
   fi
-  if obsnote recording-status >/dev/null 2>&1; then
-    PROMPT="[%F{red}●%f rec] $__OBSNOTE_ORIGINAL_PROMPT"
+  if noteshell recording-status >/dev/null 2>&1; then
+    PROMPT="[%F{red}●%f rec] $__NOTESHELL_ORIGINAL_PROMPT"
   else
-    PROMPT="$__OBSNOTE_ORIGINAL_PROMPT"
+    PROMPT="$__NOTESHELL_ORIGINAL_PROMPT"
   fi
   return 0
 }
 
 autoload -Uz add-zsh-hook
-if (( ${precmd_functions[(Ie)__obsnote_precmd]} == 0 )); then
-  add-zsh-hook precmd __obsnote_precmd
+if (( ${precmd_functions[(Ie)__noteshell_precmd]} == 0 )); then
+  add-zsh-hook precmd __noteshell_precmd
 fi
 '''.strip()
 
@@ -1165,24 +1166,24 @@ def detect_shell() -> str:
 
 def temp_shell_message(auto_mark: bool) -> str:
     if auto_mark:
-        return "obsnote shell active. A marker is already open; run `obsnote since` to write it."
-    return "obsnote shell active. Run `obsnote mark` to start capture; exit returns to your normal shell."
+        return "noteshell shell active. A marker is already open; run `noteshell since` to write it."
+    return "noteshell shell active. Run `noteshell mark` to start capture; exit returns to your normal shell."
 
 
 def temp_shell_shortcuts() -> str:
-    return "\n".join(f'{command}() {{ command obsnote {command} "$@"; }}' for command in TEMP_SHELL_SHORT_COMMANDS)
+    return "\n".join(f'{command}() {{ command noteshell {command} "$@"; }}' for command in TEMP_SHELL_SHORT_COMMANDS)
 
 
 def temp_bashrc(original_rc: Path, *, auto_mark: bool) -> str:
     rc = shlex.quote(str(original_rc))
     message = temp_shell_message(auto_mark)
     lines = [
-        "# temporary obsnote shell",
+        "# temporary noteshell shell",
         f"if [ -r {rc} ]; then",
         f"  source {rc}",
         "fi",
-        'if command -v obsnote >/dev/null 2>&1; then',
-        '  eval "$(obsnote shell-init bash)"',
+        'if command -v noteshell >/dev/null 2>&1; then',
+        '  eval "$(noteshell shell-init bash)"',
         temp_shell_shortcuts(),
         "fi",
         f'printf "\\n{message}\\n"',
@@ -1194,12 +1195,12 @@ def temp_zshrc(original_rc: Path, *, auto_mark: bool) -> str:
     rc = shlex.quote(str(original_rc))
     message = temp_shell_message(auto_mark)
     lines = [
-        "# temporary obsnote shell",
+        "# temporary noteshell shell",
         f"if [[ -r {rc} ]]; then",
         f"  source {rc}",
         "fi",
-        "if command -v obsnote >/dev/null 2>&1; then",
-        '  eval "$(obsnote shell-init zsh)"',
+        "if command -v noteshell >/dev/null 2>&1; then",
+        '  eval "$(noteshell shell-init zsh)"',
         temp_shell_shortcuts(),
         "fi",
         f'printf "\\n{message}\\n"',
@@ -1222,7 +1223,7 @@ def finish_shell_marker(name: str) -> None:
         _, entries = since_entries(argparse.Namespace(ok_only=False), name)
     except SystemExit:
         entries = []
-    if entries and confirm(f"Save commands from `{name}` with obsnote since before exiting?"):
+    if entries and confirm(f"Save commands from `{name}` with noteshell since before exiting?"):
         args = argparse.Namespace(name=name, preview=False, ok_only=False, page=None, tag=[])
         try:
             cmd_since(args)
@@ -1253,10 +1254,10 @@ def cmd_shell(args: argparse.Namespace) -> int:
             set_capture_paused(False)
             print("capture: OFF -> ON (recording until `since` or shell exit)", file=sys.stderr)
         set_marker(marker_name_started, page)
-    with tempfile.TemporaryDirectory(prefix="obsnote-shell-") as tmp:
+    with tempfile.TemporaryDirectory(prefix="noteshell-shell-") as tmp:
         tmpdir = Path(tmp)
         env = os.environ.copy()
-        env["OBSNOTE_TEMP_SHELL"] = "1"
+        env["NOTESHELL_TEMP_SHELL"] = "1"
         if shell == "bash":
             rc = tmpdir / "bashrc"
             rc.write_text(temp_bashrc(Path.home() / SHELL_RC["bash"], auto_mark=not args.no_mark), encoding="utf-8")
@@ -1266,7 +1267,7 @@ def cmd_shell(args: argparse.Namespace) -> int:
             rc.write_text(temp_zshrc(Path.home() / SHELL_RC["zsh"], auto_mark=not args.no_mark), encoding="utf-8")
             env["ZDOTDIR"] = str(tmpdir)
             argv = [binary, "-i"]
-        print(f"Starting temporary obsnote {shell} shell. Exit to return.")
+        print(f"Starting temporary noteshell {shell} shell. Exit to return.")
         code = subprocess.call(argv, env=env)
     if marker_name_started:
         finish_shell_marker(marker_name_started)
@@ -1279,11 +1280,11 @@ def cmd_doctor(_: argparse.Namespace) -> int:
 
     problems: list[str] = []
     settings = load_settings()
-    print("obsnote preflight check\n")
+    print("noteshell preflight check\n")
 
     if settings.vault is None:
         print("[!!] vault configured")
-        problems.append("No vault configured. Run: obsnote config --vault /path/to/vault")
+        problems.append("No vault configured. Run: noteshell config --vault /path/to/vault")
     else:
         exists = settings.vault.is_dir()
         print(f"{mark(exists)} vault exists: {settings.vault}")
@@ -1307,11 +1308,11 @@ def cmd_doctor(_: argparse.Namespace) -> int:
         if mismatched:
             print(f"     (active page `{mismatched}` was set for a different vault and is ignored)")
 
-    temp_shell = os.environ.get("OBSNOTE_TEMP_SHELL") == "1"
+    temp_shell = os.environ.get("NOTESHELL_TEMP_SHELL") == "1"
     if temp_shell:
-        print("[ok] temporary obsnote shell active")
+        print("[ok] temporary noteshell shell active")
     else:
-        print("[--] not currently inside `obsnote shell`")
+        print("[--] not currently inside `noteshell shell`")
 
     paused = is_capture_paused()
     if paused:
@@ -1330,7 +1331,7 @@ def cmd_doctor(_: argparse.Namespace) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="obsnote")
+    parser = argparse.ArgumentParser(prog="noteshell")
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     sub = parser.add_subparsers(dest="command_name", required=True)
 
@@ -1421,27 +1422,27 @@ def build_parser() -> argparse.ArgumentParser:
     tail.add_argument("-n", "--number", type=int, default=3, help="number of entries to show (default: 3)")
     tail.set_defaults(func=cmd_tail)
 
-    undo = sub.add_parser("undo", help="remove the last obsnote entry from a page")
+    undo = sub.add_parser("undo", help="remove the last noteshell entry from a page")
     undo.add_argument("--page", "-p", help="page to undo on (defaults to the active page)")
     undo.set_defaults(func=cmd_undo)
 
     forget = sub.add_parser(
         "forget",
-        help="clear captured commands/output from obsnote's state file",
+        help="clear captured commands/output from noteshell's state file",
         description="Clears what the shell hook has captured into local state (a shadow shell "
-        "history). Does not touch anything already written to the vault -- see `obsnote undo`.",
+        "history). Does not touch anything already written to the vault -- see `noteshell undo`.",
     )
     forget.add_argument("--last", type=int, metavar="N", help="forget only the N most recent captured commands")
     forget.set_defaults(func=cmd_forget)
 
-    shell = sub.add_parser("shell", help="start a temporary obsnote-enabled shell")
+    shell = sub.add_parser("shell", help="start a temporary noteshell-enabled shell")
     shell.add_argument("--mark", dest="mark_name", help="marker name to start automatically (default: auto-numbered)")
     shell.add_argument("--page", "-p", help="page the automatic marker belongs to")
     shell.add_argument("--no-mark", action="store_true", help="start the temporary hook without creating a marker")
     shell.add_argument("shell", nargs="?", choices=sorted(SHELL_INIT), help="shell to start (default: $SHELL, or bash)")
     shell.set_defaults(func=cmd_shell)
 
-    doctor = sub.add_parser("doctor", help="check vault, config, and current obsnote shell state")
+    doctor = sub.add_parser("doctor", help="check vault, config, and current noteshell shell state")
     doctor.set_defaults(func=cmd_doctor)
 
     pause = sub.add_parser("pause", help="pause passive shell-history capture and confirm it's off")
@@ -1458,7 +1459,7 @@ def main(argv: list[str] | None = None) -> int:
     if argv is None:
         argv = sys.argv[1:]
     if argv and argv[0] == "remember-cmd":
-        remember = argparse.ArgumentParser(prog="obsnote remember-cmd")
+        remember = argparse.ArgumentParser(prog="noteshell remember-cmd")
         remember.add_argument("--status", type=int, default=None, help="exit status of the command")
         remember.add_argument("--cwd", default=None, help="directory the command ran in")
         remember.add_argument("command", nargs=argparse.REMAINDER)
@@ -1467,18 +1468,18 @@ def main(argv: list[str] | None = None) -> int:
     if argv and argv[0] == "recording-status":
         return cmd_recording_status(argparse.Namespace())
     if argv and argv[0] == "shell-init":
-        shell_init = argparse.ArgumentParser(prog="obsnote shell-init")
+        shell_init = argparse.ArgumentParser(prog="noteshell shell-init")
         shell_init.add_argument("shell", choices=sorted(SHELL_INIT))
         args = shell_init.parse_args(argv[1:])
         return cmd_shell_init(args)
     if argv and argv[0] == "mark":
-        mark = argparse.ArgumentParser(prog="obsnote mark")
+        mark = argparse.ArgumentParser(prog="noteshell mark")
         mark.add_argument("name", nargs="?")
         mark.add_argument("--page", "-p")
         args = mark.parse_args(argv[1:])
         return cmd_mark(args)
     if argv and argv[0] == "unmark":
-        unmark = argparse.ArgumentParser(prog="obsnote unmark")
+        unmark = argparse.ArgumentParser(prog="noteshell unmark")
         unmark.add_argument("name", nargs="?")
         args = unmark.parse_args(argv[1:])
         return cmd_mark_del(args)

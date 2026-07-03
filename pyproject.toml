@@ -1,5 +1,5 @@
 [project]
-name = "obsnote"
+name = "noteshell"
 version = "0.2.0"
 description = "Capture shell commands, command output, and notes into an Obsidian vault."
 readme = "README.md"
@@ -10,7 +10,7 @@ classifiers = ["License :: OSI Approved :: MIT License"]
 dependencies = []
 
 [project.scripts]
-obsnote = "obsnote.cli:main"
+noteshell = "noteshell.cli:main"
 
 [build-system]
 requires = ["setuptools>=68"]

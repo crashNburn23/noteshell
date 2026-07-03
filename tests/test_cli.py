@@ -9,7 +9,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from obsnote import cli
+from noteshell import cli
 
 
 class CliTest(unittest.TestCase):
@@ -89,9 +89,9 @@ class CliTest(unittest.TestCase):
         self.assertEqual(stdout.strip(), str(note))
         text = note.read_text(encoding="utf-8")
         self.assertIn("hello world", text)
-        self.assertIn("From obsnote:", text)
+        self.assertIn("From noteshell:", text)
         self.assertIn("#lab", text)
-        self.assertLess(text.index("From obsnote:"), text.index("hello world"))
+        self.assertLess(text.index("From noteshell:"), text.index("hello world"))
 
     def test_mark_since_writes_command_history(self) -> None:
         self.write_config(vault=str(self.vault), note="notes.md")
@@ -108,8 +108,8 @@ class CliTest(unittest.TestCase):
         text = note.read_text(encoding="utf-8")
         expected = "```bash\necho one\n```\n\n> [!note] checkpoint\n\n```bash\necho two\n```"
         self.assertIn(expected, text)
-        self.assertIn("From obsnote:", text)
-        self.assertLess(text.index("From obsnote:"), text.index("```bash"))
+        self.assertIn("From noteshell:", text)
+        self.assertLess(text.index("From noteshell:"), text.index("```bash"))
 
     def test_mark_summary_posts_before_command_history(self) -> None:
         self.write_config(vault=str(self.vault), note="notes.md")
@@ -211,14 +211,14 @@ class CliTest(unittest.TestCase):
 
         self.assertEqual(code, 17)
         self.assertIn("Marked `lab`", stdout)
-        self.assertIn("Starting temporary obsnote bash shell", stdout)
+        self.assertIn("Starting temporary noteshell bash shell", stdout)
         self.assertIn("Deleted marker `lab`", stdout)
         self.assertEqual(launched["argv"], ["/bin/bash", "--rcfile", launched["argv"][2], "-i"])
-        self.assertEqual(launched["env"]["OBSNOTE_TEMP_SHELL"], "1")
+        self.assertEqual(launched["env"]["NOTESHELL_TEMP_SHELL"], "1")
         self.assertIn("source", str(launched["rc_text"]))
-        self.assertIn("obsnote shell-init bash", str(launched["rc_text"]))
-        self.assertIn('since() { command obsnote since "$@"; }', str(launched["rc_text"]))
-        self.assertIn('page() { command obsnote page "$@"; }', str(launched["rc_text"]))
+        self.assertIn("noteshell shell-init bash", str(launched["rc_text"]))
+        self.assertIn('since() { command noteshell since "$@"; }', str(launched["rc_text"]))
+        self.assertIn('page() { command noteshell page "$@"; }', str(launched["rc_text"]))
         state = self.read_state()
         self.assertTrue(state["capture_paused"])
         self.assertEqual(state["markers"], {})
@@ -269,11 +269,11 @@ class CliTest(unittest.TestCase):
             code, stdout, _ = self.run_cli("shell", "--no-mark", "zsh")
 
         self.assertEqual(code, 0)
-        self.assertIn("Starting temporary obsnote zsh shell", stdout)
+        self.assertIn("Starting temporary noteshell zsh shell", stdout)
         self.assertEqual(launched["argv"], ["/bin/zsh", "-i"])
-        self.assertEqual(launched["env"]["OBSNOTE_TEMP_SHELL"], "1")
-        self.assertIn("obsnote shell-init zsh", str(launched["rc_text"]))
-        self.assertIn('pause() { command obsnote pause "$@"; }', str(launched["rc_text"]))
+        self.assertEqual(launched["env"]["NOTESHELL_TEMP_SHELL"], "1")
+        self.assertIn("noteshell shell-init zsh", str(launched["rc_text"]))
+        self.assertIn('pause() { command noteshell pause "$@"; }', str(launched["rc_text"]))
         state = self.read_state()
         self.assertTrue(state["capture_paused"])
         self.assertNotIn("markers", state)
@@ -417,18 +417,18 @@ class CliTest(unittest.TestCase):
     def test_doctor(self) -> None:
         self.write_config(vault=str(self.vault), note="notes.md")
         code, stdout, _ = self.run_cli("doctor")
-        self.assertIn("obsnote preflight check", stdout)
+        self.assertIn("noteshell preflight check", stdout)
 
     def test_doctor_accepts_temporary_shell(self) -> None:
         self.write_config(vault=str(self.vault), note="notes.md")
         with (
-            mock.patch.dict(os.environ, {"OBSNOTE_TEMP_SHELL": "1"}, clear=False),
-            mock.patch.object(cli.shutil, "which", return_value="/usr/bin/obsnote"),
+            mock.patch.dict(os.environ, {"NOTESHELL_TEMP_SHELL": "1"}, clear=False),
+            mock.patch.object(cli.shutil, "which", return_value="/usr/bin/noteshell"),
         ):
             code, stdout, _ = self.run_cli("doctor")
 
         self.assertEqual(code, 0)
-        self.assertIn("temporary obsnote shell active", stdout)
+        self.assertIn("temporary noteshell shell active", stdout)
 
     def test_legacy_aliases_are_removed(self) -> None:
         for name in ("start", "stop", "last", "synth", "history-since", "mark-list", "save"):
@@ -533,7 +533,7 @@ class CliTest(unittest.TestCase):
 
         self.assertEqual(code, 0)
         text = Path(stdout.strip()).read_text(encoding="utf-8")
-        self.assertIn("# obsnote skipped a redacted command", text)
+        self.assertIn("# noteshell skipped a redacted command", text)
         self.assertNotIn("supersecret", text)
         self.assertNotIn("skipped_redacted_commands", self.read_state())
 
@@ -585,7 +585,7 @@ class CliTest(unittest.TestCase):
         code, stdout, _ = self.run_cli("shell-init", "zsh")
 
         self.assertEqual(code, 0)
-        self.assertIn("add-zsh-hook precmd __obsnote_precmd", stdout)
+        self.assertIn("add-zsh-hook precmd __noteshell_precmd", stdout)
         self.assertIn('remember-cmd --status "$last_status" --cwd "$PWD"', stdout)
         self.assertIn("●%f rec", stdout)
 
