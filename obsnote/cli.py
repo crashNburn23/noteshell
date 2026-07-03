@@ -81,6 +81,10 @@ def state_path() -> Path:
     return state_dir() / "last.json"
 
 
+def hook_error_path() -> Path:
+    return state_dir() / "hook-error.txt"
+
+
 def load_json(path: Path) -> dict[str, Any]:
     if not path.exists():
         return {}
@@ -318,6 +322,8 @@ def command_history(data: dict[str, Any]) -> list[dict[str, Any]]:
             continue
         if item.get("type") in ("note", "summary") and isinstance(item.get("text"), str):
             history.append({"at": str(item.get("at", "")), "type": str(item["type"]), "text": item["text"]})
+        elif item.get("type") == "skipped" and isinstance(item.get("reason"), str):
+            history.append({"at": str(item.get("at", "")), "type": "skipped", "reason": item["reason"]})
         elif isinstance(item.get("command"), str):
             entry: dict[str, Any] = {"at": str(item.get("at", "")), "type": "command", "command": item["command"]}
             if isinstance(item.get("status"), int):
@@ -351,10 +357,15 @@ def append_command_history(
     data = load_last()
     history = command_history(data)
     if history and history[-1].get("type") == "command" and history[-1]["command"] == command:
+        if status is not None:
+            history[-1]["status"] = status
+        if cwd is not None:
+            history[-1]["cwd"] = cwd
         data["command"] = command
         if clear_output:
             data.pop("output", None)
             data.pop("return_code", None)
+        data["command_history"] = history
         data["updated_at"] = now_stamp()
         save_json(state_path(), data)
         return
@@ -391,6 +402,40 @@ def append_session_summary(text: str) -> None:
     save_json(state_path(), data)
 
 
+def note_skipped_command(reason: str) -> None:
+    data = load_last()
+    history = command_history(data)
+    history = append_history_entry(data, history, {"at": now_stamp(), "type": "skipped", "reason": reason})
+    count_key = f"skipped_{reason}_commands"
+    current = data.get(count_key, 0)
+    data[count_key] = (current if isinstance(current, int) else 0) + 1
+    data["command_history"] = history
+    data["updated_at"] = now_stamp()
+    save_json(state_path(), data)
+
+
+def pop_skipped_counts(data: dict[str, Any]) -> dict[str, int]:
+    skipped: dict[str, int] = {}
+    for key in list(data):
+        if key.startswith("skipped_") and key.endswith("_commands"):
+            value = data.get(key)
+            if isinstance(value, int) and value > 0:
+                skipped[key.removeprefix("skipped_").removesuffix("_commands")] = value
+            data.pop(key, None)
+    return skipped
+
+
+def hook_error() -> str | None:
+    path = hook_error_path()
+    try:
+        if path.exists():
+            text = path.read_text(encoding="utf-8").strip()
+            return text or None
+    except OSError:
+        return None
+    return None
+
+
 def markers(data: dict[str, Any]) -> dict[str, Any]:
     raw = data.get("markers", {})
     return raw if isinstance(raw, dict) else {}
@@ -424,24 +469,12 @@ def history_since_marker(name: str) -> tuple[dict[str, Any], list[dict[str, Any]
     return marker, history[marker["index"] :]
 
 
-def require_last_command() -> dict[str, Any]:
-    data = load_last()
-    if not data.get("command"):
-        raise SystemExit(
-            "No last command remembered yet.\n"
-            "For interactive shell history, run: eval \"$(obsnote shell-init bash)\"\n"
-            "To make it permanent, run: obsnote shell-install bash"
-        )
-    return data
-
-
 def require_last_output() -> dict[str, Any]:
     data = load_last()
     if not data.get("command") or data.get("output") is None:
         raise SystemExit(
             "No captured command output found yet.\n"
-            "Run a command through obsnote first, for example: obsnote run -- ls -la\n"
-            "Then use: obsnote save --output"
+            "Run a command through obsnote first, for example: obsnote run -- ls -la"
         )
     return data
 
@@ -531,9 +564,14 @@ def cmd_remember_cmd(args: argparse.Namespace) -> int:
         return 0
     settings = load_settings()
     if is_redacted(command, settings):
+        note_skipped_command("redacted")
         return 0
     append_command_history(command, status=args.status, cwd=args.cwd)
     return 0
+
+
+def cmd_recording_status(_: argparse.Namespace) -> int:
+    return 1 if is_capture_paused() else 0
 
 
 def cmd_pause(_: argparse.Namespace) -> int:
@@ -543,7 +581,7 @@ def cmd_pause(_: argparse.Namespace) -> int:
     if confirmed:
         print("obsnote will not record anything typed at the shell until you run: obsnote resume")
         print("(or `obsnote mark`, which turns capture back on too). Explicit commands")
-        print("(note/run/save/annotate) still work normally -- only the passive shell hook is paused.")
+        print("(note/run/annotate) still work normally -- only the passive shell hook is paused.")
     else:
         print("WARNING: could not confirm the paused state was saved. Check permissions on:")
         print(f"  {state_path()}")
@@ -635,13 +673,6 @@ def cmd_summary(args: argparse.Namespace) -> int:
     return 0
 
 
-def append_last_command(page: str, tags: str) -> Path:
-    settings = load_settings()
-    data = require_last_command()
-    command = data.get("command")
-    return append_markdown(settings, page, f"{entry_footer(tags)}\n\n{fence(command, 'bash')}")
-
-
 def append_last_output(page: str, tags: str) -> Path:
     settings = load_settings()
     data = require_last_output()
@@ -662,11 +693,9 @@ def append_last_output(page: str, tags: str) -> Path:
 
 
 def cmd_run(args: argparse.Namespace) -> int:
-    if args.synth and args.no_append:
-        raise SystemExit("`obsnote run` cannot combine --synth and --no-append.")
     command_argv = strip_separator(args.command)
     if not command_argv:
-        raise SystemExit("Usage: obsnote run [--synth|--no-append] -- <command> [args...]")
+        raise SystemExit("Usage: obsnote run [--synth] -- <command> [args...]")
     command = shell_join(command_argv)
     try:
         proc = subprocess.Popen(
@@ -689,14 +718,13 @@ def cmd_run(args: argparse.Namespace) -> int:
     output = "".join(chunks)
     save_last({"command": command, "output": output, "return_code": return_code})
     append_command_history(command, clear_output=False)
-    if not args.no_append:
-        settings = load_settings()
-        page = resolve_target_page(args.page, settings)
-        tags = format_tags(args.tag)
-        if args.synth:
-            print(append_last_summary(page, tags))
-        else:
-            print(append_last_output(page, tags))
+    settings = load_settings()
+    page = resolve_target_page(args.page, settings)
+    tags = format_tags(args.tag)
+    if args.synth:
+        print(append_last_summary(page, tags))
+    else:
+        print(append_last_output(page, tags))
     return return_code
 
 
@@ -749,6 +777,8 @@ def synthesize_history(settings: Settings, name: str, entries: list[dict[str, An
             lines.append(f"- {entry['at']}: [note] {entry.get('text', '')}")
         elif entry.get("type") == "summary":
             lines.append(f"- {entry['at']}: [summary] {entry.get('text', '')}")
+        elif entry.get("type") == "skipped":
+            lines.append(f"- {entry['at']}: [skipped {entry.get('reason', 'unknown')} command]")
         else:
             lines.append(f"- {entry['at']}: {entry.get('command', '')}")
     command_list = "\n".join(lines)
@@ -800,20 +830,6 @@ def append_last_summary(page: str, tags: str) -> Path:
     return append_markdown(settings, page, markdown)
 
 
-def cmd_save(args: argparse.Namespace) -> int:
-    settings = load_settings()
-    page = resolve_target_page(args.page, settings)
-    tags = format_tags(args.tag)
-    if args.output:
-        path = append_last_output(page, tags)
-    elif args.synth:
-        path = append_last_summary(page, tags)
-    else:
-        path = append_last_command(page, tags)
-    print(path)
-    return 0
-
-
 def set_marker(name: str, page: str) -> None:
     data = load_last()
     history = command_history(data)
@@ -837,40 +853,6 @@ def cmd_mark(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_mark_list(args: argparse.Namespace) -> int:
-    name = getattr(args, "name", None)
-    if name:
-        return cmd_mark_show(name)
-    data = load_last()
-    history = command_history(data)
-    all_markers = markers(data)
-    if not all_markers:
-        print("No markers set.")
-        return 0
-    for marker_key in sorted(all_markers):
-        marker = all_markers[marker_key]
-        if not isinstance(marker, dict):
-            continue
-        index = marker.get("index")
-        at = marker.get("at", "unknown")
-        page = marker.get("page") or "(default)"
-        remaining = len(history) - index if isinstance(index, int) else "unknown"
-        print(f"{marker_key}\tset={at}\tpage={page}\tcommands_since={remaining}")
-    return 0
-
-
-def cmd_mark_show(raw_name: str) -> int:
-    name = marker_name(raw_name)
-    marker, entries = history_since_marker(name)
-    page = marker.get("page") or "(default)"
-    if not entries:
-        print(f"No commands recorded since marker `{name}` (set {marker.get('at', 'unknown')}, page: {page}).")
-        return 0
-    print(f"--- commands since `{name}` (page: {page}, set {marker.get('at', 'unknown')}) ---\n")
-    print(format_session_markdown(entries))
-    return 0
-
-
 def cmd_mark_del(args: argparse.Namespace) -> int:
     name = resolve_marker_arg(args.name)
     data = load_last()
@@ -887,6 +869,20 @@ def cmd_mark_del(args: argparse.Namespace) -> int:
         set_capture_paused(True)
         print("capture: ON -> OFF (auto-paused; no markers left)", file=sys.stderr)
     return 0
+
+
+def delete_marker(name: str) -> int:
+    data = load_last()
+    all_markers = markers(data)
+    if name not in all_markers:
+        return len(all_markers)
+    del all_markers[name]
+    data["markers"] = all_markers
+    if not all_markers:
+        pop_skipped_counts(data)
+    data["updated_at"] = now_stamp()
+    save_json(state_path(), data)
+    return len(all_markers)
 
 
 def note_callout(text: str) -> str:
@@ -935,6 +931,8 @@ def format_history_markdown(entries: list[dict[str, Any]]) -> str:
             blocks.append(note_callout(str(entry.get("text", ""))))
         elif entry.get("type") == "summary":
             continue
+        elif entry.get("type") == "skipped":
+            command_lines.append(f"# obsnote skipped a {entry.get('reason', 'unknown')} command")
         else:
             cwd = entry.get("cwd")
             if annotate_cwd and isinstance(cwd, str) and cwd != current_cwd:
@@ -968,7 +966,7 @@ def filter_ok_only(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [
         entry
         for entry in entries
-        if entry.get("type") in ("note", "summary") or entry.get("status") in (None, 0)
+        if entry.get("type") in ("note", "summary", "skipped") or entry.get("status") in (None, 0)
     ]
 
 
@@ -994,7 +992,7 @@ def since_entries(args: argparse.Namespace, name: str) -> tuple[dict[str, Any], 
 
 def cmd_history_since(args: argparse.Namespace) -> int:
     settings = load_settings()
-    name = resolve_marker_arg(args.name)
+    name = getattr(args, "_resolved_marker_name", None) or resolve_marker_arg(args.name)
     marker, entries = since_entries(args, name)
     page = resolve_since_page(args, settings, marker)
     tags = format_tags(args.tag)
@@ -1009,7 +1007,7 @@ def cmd_history_since(args: argparse.Namespace) -> int:
 
 def cmd_synth_since(args: argparse.Namespace) -> int:
     settings = load_settings()
-    name = resolve_marker_arg(args.name)
+    name = getattr(args, "_resolved_marker_name", None) or resolve_marker_arg(args.name)
     marker, entries = since_entries(args, name)
     summary = synthesize_history(settings, name, entries)
     page = resolve_since_page(args, settings, marker)
@@ -1024,10 +1022,10 @@ def cmd_synth_since(args: argparse.Namespace) -> int:
     return 0
 
 
-def maybe_auto_pause_after_since() -> None:
+def maybe_auto_pause_after_since(remaining_markers: int) -> None:
     if is_capture_paused():
         return
-    if len(markers(load_last())) > 1:
+    if remaining_markers > 0:
         print(
             "capture: staying ON -- other markers are still pending (run `obsnote pause` if you're done)",
             file=sys.stderr,
@@ -1038,8 +1036,19 @@ def maybe_auto_pause_after_since() -> None:
 
 
 def cmd_since(args: argparse.Namespace) -> int:
+    name = resolve_marker_arg(args.name)
+    setattr(args, "_resolved_marker_name", name)
+    if args.preview and args.synth:
+        raise SystemExit("`obsnote since` cannot combine --preview and --synth.")
+    if args.preview:
+        marker, entries = since_entries(args, name)
+        page = marker.get("page") or "(default)"
+        print(f"--- commands since `{name}` (page: {page}, set {marker.get('at', 'unknown')}) ---\n")
+        print(format_session_markdown(entries))
+        return 0
     result = cmd_synth_since(args) if args.synth else cmd_history_since(args)
-    maybe_auto_pause_after_since()
+    remaining_markers = delete_marker(name)
+    maybe_auto_pause_after_since(remaining_markers)
     return result
 
 
@@ -1119,12 +1128,33 @@ def cmd_show(_: argparse.Namespace) -> int:
             print("last output preview:")
             print(preview)
             if clipped:
-                print("[preview truncated; obsnote save --output writes the full capture]")
+                print("[preview truncated; obsnote run writes the full capture]")
     else:
         print("no command captured yet")
     all_markers = markers(data)
     if all_markers:
-        print(f"markers: {', '.join(sorted(all_markers))}")
+        history = command_history(data)
+        print("markers:")
+        for marker_key in sorted(all_markers):
+            marker = all_markers[marker_key]
+            if not isinstance(marker, dict):
+                continue
+            index = marker.get("index")
+            page = marker.get("page") or "(default)"
+            pending = len(history) - index if isinstance(index, int) else "unknown"
+            print(f"  {marker_key}: {pending} pending, page: {page}, set: {marker.get('at', 'unknown')}")
+    skipped = {
+        key.removeprefix("skipped_").removesuffix("_commands"): value
+        for key, value in data.items()
+        if key.startswith("skipped_") and key.endswith("_commands") and isinstance(value, int) and value > 0
+    }
+    if skipped:
+        parts = [f"{count} {reason}" for reason, count in sorted(skipped.items())]
+        print(f"skipped commands pending: {', '.join(parts)}")
+    error = hook_error()
+    if error:
+        print("shell hook warning:")
+        print(f"  {error}")
     return 0
 
 
@@ -1178,8 +1208,23 @@ __obsnote_prompt_command() {
   cmd="$(HISTTIMEFORMAT= fc -ln -1 2>/dev/null | sed '1s/^[[:space:]]*//')"
   case "$cmd" in
     ""|obsnote*) ;;
-    *) obsnote remember-cmd --status "$last_status" --cwd "$PWD" -- "$cmd" >/dev/null 2>&1 || true ;;
+    *)
+      if obsnote remember-cmd --status "$last_status" --cwd "$PWD" -- "$cmd" >/dev/null 2>&1; then
+        rm -f "${XDG_STATE_HOME:-$HOME/.local/state}/obsnote/hook-error.txt" 2>/dev/null || true
+      else
+        mkdir -p "${XDG_STATE_HOME:-$HOME/.local/state}/obsnote" 2>/dev/null || true
+        printf "remember-cmd failed with exit %s; run obsnote doctor or obsnote show\n" "$?" > "${XDG_STATE_HOME:-$HOME/.local/state}/obsnote/hook-error.txt" 2>/dev/null || true
+      fi
+      ;;
   esac
+  if [ -z "${__OBSNOTE_ORIGINAL_PS1+x}" ]; then
+    __OBSNOTE_ORIGINAL_PS1="$PS1"
+  fi
+  if obsnote recording-status >/dev/null 2>&1; then
+    PS1="[\[\e[31m\]●\[\e[0m\] rec] $__OBSNOTE_ORIGINAL_PS1"
+  else
+    PS1="$__OBSNOTE_ORIGINAL_PS1"
+  fi
   return $last_status
 }
 
@@ -1201,8 +1246,23 @@ __obsnote_precmd() {
   cmd="$(fc -ln -1 2>/dev/null | sed '1s/^[[:space:]]*//')"
   case "$cmd" in
     ""|obsnote*) ;;
-    *) obsnote remember-cmd --status "$last_status" --cwd "$PWD" -- "$cmd" >/dev/null 2>&1 || true ;;
+    *)
+      if obsnote remember-cmd --status "$last_status" --cwd "$PWD" -- "$cmd" >/dev/null 2>&1; then
+        rm -f "${XDG_STATE_HOME:-$HOME/.local/state}/obsnote/hook-error.txt" 2>/dev/null || true
+      else
+        mkdir -p "${XDG_STATE_HOME:-$HOME/.local/state}/obsnote" 2>/dev/null || true
+        printf "remember-cmd failed with exit %s; run obsnote doctor or obsnote show\n" "$?" > "${XDG_STATE_HOME:-$HOME/.local/state}/obsnote/hook-error.txt" 2>/dev/null || true
+      fi
+      ;;
   esac
+  if [[ -z ${__OBSNOTE_ORIGINAL_PROMPT+x} ]]; then
+    __OBSNOTE_ORIGINAL_PROMPT="$PROMPT"
+  fi
+  if obsnote recording-status >/dev/null 2>&1; then
+    PROMPT="[%F{red}●%f rec] $__OBSNOTE_ORIGINAL_PROMPT"
+  else
+    PROMPT="$__OBSNOTE_ORIGINAL_PROMPT"
+  fi
   return 0
 }
 
@@ -1272,7 +1332,7 @@ def cmd_shell_uninstall(args: argparse.Namespace) -> int:
     rc.write_text(new_text, encoding="utf-8")
     print(f"Removed obsnote shell integration from {rc}")
     print(f"Open a new shell, or run: source ~/{SHELL_RC[args.shell]}")
-    print("Passive capture won't run anymore -- explicit commands (note/run/save/mark/...)")
+    print("Passive capture won't run anymore -- explicit commands (note/run/mark/...)")
     print("still work normally.")
     return 0
 
@@ -1392,17 +1452,8 @@ def build_parser() -> argparse.ArgumentParser:
     note.add_argument("text", nargs=argparse.REMAINDER)
     note.set_defaults(func=cmd_note)
 
-    save = sub.add_parser("save", help="append remembered command, output, or summary")
-    save_mode = save.add_mutually_exclusive_group()
-    save_mode.add_argument("--output", action="store_true", help="append last captured command output")
-    save_mode.add_argument("--synth", action="store_true", help="append local-LLM summary of last captured output")
-    save.add_argument("--page", "-p", help="target page for this entry only")
-    save.add_argument("--tag", "-t", action="append", default=[], help="inline #tag; repeatable")
-    save.set_defaults(func=cmd_save)
-
     run = sub.add_parser("run", help="run a command, capture output, and append it")
     run.add_argument("--synth", action="store_true", help="append a local-LLM summary instead of raw output")
-    run.add_argument("--no-append", action="store_true", help="capture state without writing to Obsidian")
     run.add_argument("--page", "-p", help="target page for this entry only")
     run.add_argument("--tag", "-t", action="append", default=[], help="inline #tag; repeatable")
     run.add_argument("command", nargs=argparse.REMAINDER)
@@ -1412,10 +1463,6 @@ def build_parser() -> argparse.ArgumentParser:
     mark.add_argument("name", nargs="?", help="marker name (defaults to an auto-numbered '1', '2', ...)")
     mark.add_argument("--page", "-p", help="page this marker belongs to (defaults to the active page)")
     mark.set_defaults(func=cmd_mark)
-
-    marks = sub.add_parser("marks", help="list markers, or preview commands recorded since one")
-    marks.add_argument("name", nargs="?", help="if given, show the commands recorded since this marker (read-only)")
-    marks.set_defaults(func=cmd_mark_list)
 
     unmark = sub.add_parser("unmark", help="delete a marker")
     unmark.add_argument(
@@ -1428,6 +1475,7 @@ def build_parser() -> argparse.ArgumentParser:
         "name", nargs="?", help="marker name (defaults to 'default', or the only marker if just one exists)"
     )
     since.add_argument("--synth", action="store_true", help="append a local-LLM summary")
+    since.add_argument("--preview", action="store_true", help="render pending commands without writing or closing marker")
     since.add_argument(
         "--ok-only",
         dest="ok_only",
@@ -1442,7 +1490,7 @@ def build_parser() -> argparse.ArgumentParser:
         "annotate",
         help="insert a note into the command timeline, e.g. between commands in a mark session",
         description="Reads stdin when text is omitted. Shows up inline (as a comment) the next time "
-        "`since`/`marks <name>` renders the commands recorded around it.",
+        "`since`/`since --preview` renders the commands recorded around it.",
     )
     annotate.add_argument("text", nargs=argparse.REMAINDER)
     annotate.set_defaults(func=cmd_annotate)
@@ -1451,7 +1499,7 @@ def build_parser() -> argparse.ArgumentParser:
         "summary",
         help="add a summary to the current mark session",
         description="Reads stdin when text is omitted. The summary is rendered before the command "
-        "timeline the next time `since`/`marks <name>` renders a mark session.",
+        "timeline the next time `since`/`since --preview` renders a mark session.",
     )
     summary.add_argument("text", nargs=argparse.REMAINDER)
     summary.set_defaults(func=cmd_summary)
@@ -1469,10 +1517,10 @@ def build_parser() -> argparse.ArgumentParser:
     page_use.add_argument("name")
     page_use.set_defaults(func=cmd_page_use)
 
-    page.set_defaults(func=cmd_page_show)
+    page_list = page_sub.add_parser("list", help="list pages in the vault")
+    page_list.set_defaults(func=cmd_pages)
 
-    pages = sub.add_parser("pages", help="list pages in the vault")
-    pages.set_defaults(func=cmd_pages)
+    page.set_defaults(func=cmd_page_show)
 
     show = sub.add_parser("show", help="show current capture state without writing to the vault")
     show.set_defaults(func=cmd_show)
@@ -1519,43 +1567,10 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def rewrite_legacy_args(argv: list[str]) -> list[str]:
-    if not argv:
-        return argv
-    command = argv[0]
-    rest = argv[1:]
-    if command == "remember-cmd":
-        return argv
-    if command == "last-cmd":
-        return ["save", *rest]
-    if command == "last":
-        return ["save", "--output", *rest]
-    if command == "synth":
-        return ["save", "--synth", *rest]
-    if command == "mark-list":
-        return ["marks", *rest]
-    if command == "mark-del":
-        return ["unmark", *rest]
-    if command == "mark" and rest[:1] == ["list"]:
-        return ["marks", *rest[1:]]
-    if command == "mark" and rest[:1] == ["del"]:
-        return ["unmark", *rest[1:]]
-    if command == "history-since":
-        return ["since", *rest]
-    if command == "synth-since":
-        return ["since", *rest, "--synth"]
-    if command == "start":
-        return ["doctor", *rest]
-    if command == "stop":
-        return ["pause", *rest]
-    return argv
-
-
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     if argv is None:
         argv = sys.argv[1:]
-    argv = rewrite_legacy_args(argv)
     if argv and argv[0] == "remember-cmd":
         remember = argparse.ArgumentParser(prog="obsnote remember-cmd")
         remember.add_argument("--status", type=int, default=None, help="exit status of the command")
@@ -1563,5 +1578,7 @@ def main(argv: list[str] | None = None) -> int:
         remember.add_argument("command", nargs=argparse.REMAINDER)
         args = remember.parse_args(argv[1:])
         return cmd_remember_cmd(args)
+    if argv and argv[0] == "recording-status":
+        return cmd_recording_status(argparse.Namespace())
     args = parser.parse_args(argv)
     return int(args.func(args))

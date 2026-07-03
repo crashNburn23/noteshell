@@ -62,10 +62,10 @@ class CliTest(unittest.TestCase):
         self.assertIn("note: notes.md", stdout)
         self.assertEqual(json.loads(cli.config_path().read_text(encoding="utf-8"))["note"], "notes.md")
 
-    def test_stop_resume_and_remember_cmd_respects_pause(self) -> None:
+    def test_pause_resume_and_remember_cmd_respects_pause(self) -> None:
         self.write_config(vault=str(self.vault), note="notes.md")
 
-        code, stdout, _ = self.run_cli("stop")
+        code, stdout, _ = self.run_cli("pause")
         self.assertEqual(code, 0)
         self.assertIn("capture_paused = True", stdout)
 
@@ -176,13 +176,13 @@ class CliTest(unittest.TestCase):
         self.assertNotIn("old entry", stdout)
         self.assertIn("newer entry", stdout)
 
-    def test_pause_and_legacy_stop_alias(self) -> None:
+    def test_pause_confirms_capture_off(self) -> None:
         code, stdout, _ = self.run_cli("pause")
         self.assertEqual(code, 0)
         self.assertIn("capture_paused = True", stdout)
 
         self.run_cli("resume")
-        code, stdout, _ = self.run_cli("stop")
+        code, stdout, _ = self.run_cli("pause")
         self.assertEqual(code, 0)
         self.assertIn("capture_paused = True", stdout)
 
@@ -242,6 +242,20 @@ class CliTest(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn("staying ON", stderr)
         self.assertFalse(self.read_state().get("capture_paused"))
+        self.assertEqual(set(self.read_state()["markers"]), {"lab2"})
+
+    def test_since_with_no_other_markers_deletes_marker_and_auto_pauses(self) -> None:
+        self.write_config(vault=str(self.vault), note="notes.md")
+        self.run_cli("mark", "lab")
+        self.run_cli("remember-cmd", "--", "echo one")
+
+        code, _, stderr = self.run_cli("since", "lab")
+
+        self.assertEqual(code, 0)
+        self.assertIn("ON -> OFF", stderr)
+        state = self.read_state()
+        self.assertEqual(state.get("markers"), {})
+        self.assertTrue(state["capture_paused"])
 
     def test_unmark_auto_pauses_when_last_marker_removed(self) -> None:
         self.write_config(vault=str(self.vault), note="notes.md")
@@ -298,11 +312,33 @@ class CliTest(unittest.TestCase):
         text = (self.vault / "notes.md").read_text(encoding="utf-8")
         self.assertIn("echo one", text)
 
-    def test_doctor_and_legacy_start_alias(self) -> None:
+    def test_since_preview_does_not_write_or_consume_marker(self) -> None:
         self.write_config(vault=str(self.vault), note="notes.md")
-        for name in ("doctor", "start"):
-            code, stdout, _ = self.run_cli(name)
-            self.assertIn("obsnote preflight check", stdout, name)
+        self.run_cli("mark", "lab")
+        self.run_cli("remember-cmd", "--", "echo one")
+
+        code, stdout, _ = self.run_cli("since", "lab", "--preview")
+
+        self.assertEqual(code, 0)
+        self.assertIn("commands since `lab`", stdout)
+        self.assertIn("echo one", stdout)
+        self.assertFalse((self.vault / "notes.md").exists())
+        self.assertIn("lab", self.read_state()["markers"])
+
+    def test_doctor(self) -> None:
+        self.write_config(vault=str(self.vault), note="notes.md")
+        code, stdout, _ = self.run_cli("doctor")
+        self.assertIn("obsnote preflight check", stdout)
+
+    def test_legacy_aliases_are_removed(self) -> None:
+        for name in ("start", "stop", "last", "synth", "history-since", "mark-list", "save"):
+            with self.assertRaises(SystemExit):
+                self.run_cli(name)
+
+    def test_run_no_append_option_is_removed(self) -> None:
+        self.write_config(vault=str(self.vault), note="notes.md")
+        with self.assertRaises(SystemExit):
+            self.run_cli("run", "--no-append", "--", "echo", "hi")
 
     def test_undo_removes_only_last_entry(self) -> None:
         self.write_config(vault=str(self.vault), note="notes.md")
@@ -367,6 +403,35 @@ class CliTest(unittest.TestCase):
         self.assertIn("echo ok", text)
         self.assertNotIn("false", text)
 
+    def test_duplicate_command_updates_status_and_cwd(self) -> None:
+        self.write_config(vault=str(self.vault), note="notes.md")
+        self.run_cli("mark", "lab")
+        self.run_cli("remember-cmd", "--status", "1", "--cwd", "/srv/old", "--", "pytest")
+        self.run_cli("remember-cmd", "--status", "0", "--cwd", "/srv/new", "--", "pytest")
+
+        code, stdout, _ = self.run_cli("since", "lab", "--ok-only")
+
+        self.assertEqual(code, 0)
+        text = Path(stdout.strip()).read_text(encoding="utf-8")
+        self.assertIn("pytest", text)
+        self.assertNotIn("# exited 1", text)
+        history = self.read_state()["command_history"]
+        self.assertEqual(history[-1]["status"], 0)
+        self.assertEqual(history[-1]["cwd"], "/srv/new")
+
+    def test_redacted_command_leaves_placeholder_without_command_text(self) -> None:
+        self.write_config(vault=str(self.vault), note="notes.md")
+        self.run_cli("mark", "lab")
+        self.run_cli("remember-cmd", "--", "TOKEN=supersecret curl example.test")
+
+        code, stdout, _ = self.run_cli("since", "lab")
+
+        self.assertEqual(code, 0)
+        text = Path(stdout.strip()).read_text(encoding="utf-8")
+        self.assertIn("# obsnote skipped a redacted command", text)
+        self.assertNotIn("supersecret", text)
+        self.assertNotIn("skipped_redacted_commands", self.read_state())
+
     def test_since_uniform_cwd_is_not_annotated(self) -> None:
         self.write_config(vault=str(self.vault), note="notes.md")
         self.run_cli("mark", "lab")
@@ -396,12 +461,51 @@ class CliTest(unittest.TestCase):
         _, stdout, _ = self.run_cli("page")
         self.assertIn("it was set for a different vault", stdout)
 
+    def test_page_list_lists_pages(self) -> None:
+        self.write_config(vault=str(self.vault), note="notes.md")
+        self.run_cli("page", "new", "Course/Lab1")
+        self.run_cli("note", "--page", "scratch", "hello")
+
+        code, stdout, _ = self.run_cli("page", "list")
+
+        self.assertEqual(code, 0)
+        self.assertIn("* Course/Lab1.md", stdout)
+        self.assertIn("  scratch.md", stdout)
+
+    def test_top_level_pages_command_is_removed(self) -> None:
+        with self.assertRaises(SystemExit):
+            self.run_cli("pages")
+
     def test_shell_init_zsh_prints_precmd_hook(self) -> None:
         code, stdout, _ = self.run_cli("shell-init", "zsh")
 
         self.assertEqual(code, 0)
         self.assertIn("add-zsh-hook precmd __obsnote_precmd", stdout)
         self.assertIn('remember-cmd --status "$last_status" --cwd "$PWD"', stdout)
+        self.assertIn("●%f rec", stdout)
+
+    def test_recording_status_reflects_capture_state(self) -> None:
+        code, _, _ = self.run_cli("recording-status")
+        self.assertEqual(code, 0)
+
+        self.run_cli("pause")
+        code, _, _ = self.run_cli("recording-status")
+        self.assertEqual(code, 1)
+
+    def test_show_includes_marker_details_skipped_count_and_hook_warning(self) -> None:
+        self.write_config(vault=str(self.vault), note="notes.md")
+        self.run_cli("mark", "lab")
+        self.run_cli("remember-cmd", "--", "TOKEN=supersecret curl example.test")
+        cli.hook_error_path().parent.mkdir(parents=True, exist_ok=True)
+        cli.hook_error_path().write_text("remember-cmd failed with exit 1", encoding="utf-8")
+
+        code, stdout, _ = self.run_cli("show")
+
+        self.assertEqual(code, 0)
+        self.assertIn("markers:", stdout)
+        self.assertIn("lab: 1 pending, page: notes.md", stdout)
+        self.assertIn("skipped commands pending: 1 redacted", stdout)
+        self.assertIn("shell hook warning:", stdout)
 
     def test_invalid_page_path_is_rejected(self) -> None:
         self.write_config(vault=str(self.vault), note="notes.md")
